@@ -61,15 +61,24 @@ class Pty:
         argv = _to_argv(command)
         if not argv:
             raise ValueError("empty command")
-        # pywinpty takes the executable and its args separately. The args must
-        # be passed as a *leading-space* command line that still includes
-        # argv[0], and env must be supplied at the same time (without env,
-        # pywinpty silently drops the args).
+        # pywinpty takes the executable and its args separately. The safe forms:
+        #   - no args  -> spawn(exe, cwd)            (a cmdline here would make
+        #                                            the exe path appear as the
+        #                                            program's first argument,
+        #                                            e.g. Claude treating its own
+        #                                            path as a prompt)
+        #   - with args -> spawn(exe, " " + args, cwd, env)  (leading space, no
+        #                                            argv[0]; env is required or
+        #                                            pywinpty drops the args)
         exe = shutil.which(argv[0]) or argv[0].strip('"')
-        env = _build_env()
-        cmdline = " " + subprocess.list2cmdline(argv)
         self._pty = winpty.PTY(cols, rows)
-        if not self._pty.spawn(exe, cmdline, cwd=cwd, env=env):
+        if len(argv) > 1:
+            env = _build_env()
+            cmdline = " " + subprocess.list2cmdline(argv[1:])
+            ok = self._pty.spawn(exe, cmdline, cwd=cwd, env=env)
+        else:
+            ok = self._pty.spawn(exe, cwd=cwd)
+        if not ok:
             raise RuntimeError(f"Failed to spawn: {command}")
         self._pid = int(self._pty.pid)
         self._on_output: Optional[Callable[[str], None]] = None

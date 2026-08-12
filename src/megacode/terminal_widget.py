@@ -15,8 +15,8 @@ from typing import List, Optional
 
 import pyte
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPalette
-from PySide6.QtWidgets import QWidget
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QGuiApplication, QPainter, QPalette
+from PySide6.QtWidgets import QMenu, QWidget
 
 from .conpty import Pty
 
@@ -28,6 +28,12 @@ _PRIVATE_SGR = re.compile(r"\x1b\[[<>=?][0-9;:]*m")
 # A trailing, possibly-incomplete numeric CSI -- held back so a private sequence
 # is never split across two reads (which would defeat the filter).
 _TRAILING_CSI = re.compile(r"\x1b\[[<>=?]?[0-9;:]*$")
+# DEC private mode set/reset: ESC[?Ps...h  / ESC[?Ps...l  (bracketed paste,
+# mouse tracking, focus reporting, ...)
+_PRIV_MODE = re.compile(r"\x1b\[\?([0-9;]+)([hl])")
+_BRACKETED_PASTE = 2004
+_MOUSE_TRACKING = {1000, 1002, 1003}  # X10 / button-event / any-event
+_SGR_MOUSE = 1006
 
 # --- theme & palette --------------------------------------------------------
 _DEFAULT_FG = "#d4d4d4"
@@ -100,6 +106,12 @@ class TerminalWidget(QWidget):
 
         self._default_fg = QColor(_DEFAULT_FG)
         self._default_bg = QColor(_DEFAULT_BG)
+        # text selection + copy/paste
+        self._sel_active = False
+        self._sel_start: Optional[tuple[int, int]] = None
+        self._sel_end: Optional[tuple[int, int]] = None
+        # private modes parsed from the output stream
+        self._priv_modes: set[int] = set()
         palette = self.palette()
         palette.setColor(QPalette.ColorRole.Window, self._default_bg)
         palette.setColor(QPalette.ColorRole.Base, self._default_bg)
@@ -120,11 +132,33 @@ class TerminalWidget(QWidget):
         else:
             ready, self._pty_buf = buf, ""
         ready = _PRIVATE_SGR.sub("", ready)
+        self._update_priv_modes(ready)
         if ready:
             with self._lock:
                 self._stream.feed(ready)
         # signal crosses from the reader thread to the GUI thread (queued)
         self.update()
+
+    def _update_priv_modes(self, text: str) -> None:
+        for params, final in _PRIV_MODE.findall(text):
+            on = final == "h"
+            for num in params.split(";"):
+                try:
+                    mode = int(num)
+                except ValueError:
+                    continue
+                if on:
+                    self._priv_modes.add(mode)
+                else:
+                    self._priv_modes.discard(mode)
+
+    @property
+    def _bracketed_paste(self) -> bool:
+        return _BRACKETED_PASTE in self._priv_modes
+
+    @property
+    def _mouse_on(self) -> bool:
+        return bool(self._priv_modes & _MOUSE_TRACKING)
 
     # --- painting -----------------------------------------------------------
     def paintEvent(self, _event) -> None:  # noqa: N802 (Qt signature)
@@ -151,10 +185,20 @@ class TerminalWidget(QWidget):
         if not cursor_hidden and not self._dead and 0 <= cursor_y < lines and 0 <= cursor_x < columns:
             self._draw_cursor(painter, cursor_x, cursor_y, snapshot[cursor_y][cursor_x])
 
+        self._draw_selection(painter)
+
         if self._dead:
             painter.fillRect(self.rect(), QColor(0, 0, 0, 170))
             painter.setPen(QColor("#cccccc"))
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "[ process exited ]")
+
+    def _draw_selection(self, painter: QPainter) -> None:
+        if not self._sel_active or self._sel_start is None or self._sel_end is None:
+            return
+        for r, c1, c2 in self._selection_ranges():
+            x = c1 * self._cell_w
+            y = r * self._cell_h
+            painter.fillRect(x, y, (c2 - c1 + 1) * self._cell_w, self._cell_h, _SELECTION)
 
     def _draw_row(self, painter: QPainter, row: int, chars: list, columns: int) -> None:
         y = row * self._cell_h
@@ -211,11 +255,156 @@ class TerminalWidget(QWidget):
 
     # --- input --------------------------------------------------------------
     def keyPressEvent(self, event) -> None:  # noqa: N802 (Qt signature)
+        mods = event.modifiers()
+        key = event.key()
+        ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
+        shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+
+        # Copy / paste (Windows-style: Ctrl+Shift+C/V, Ctrl+Ins / Shift+Ins).
+        copy_combo = (ctrl and shift and key == Qt.Key.Key_C) or (ctrl and key == Qt.Key.Key_Insert)
+        paste_combo = (ctrl and key == Qt.Key.Key_V) or (shift and key == Qt.Key.Key_Insert)
+        if copy_combo:
+            text = self._selection_text()
+            if text:
+                self._copy_text(text)
+            return
+        if paste_combo:
+            self.paste()
+            return
+        # Plain Ctrl+C: copy if there is a selection, otherwise send SIGINT.
+        if ctrl and key == Qt.Key.Key_C and self.has_selection():
+            self._copy_text(self._selection_text())
+            self._clear_selection()
+            return
+
         seq = self._encode_key(event)
         if seq:
             self._pty.write(seq)
         else:
             super().keyPressEvent(event)
+
+    # --- mouse: selection / forwarding / paste -----------------------------
+    def _cell_at(self, pos) -> tuple[int, int]:
+        col = max(0, min(self._cols - 1, int(pos.x()) // self._cell_w))
+        row = max(0, min(self._rows - 1, int(pos.y()) // self._cell_h))
+        return (row, col)
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 (Qt signature)
+        if self._mouse_on:
+            self._send_mouse(event, pressed=True)
+            return
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._sel_start = self._sel_end = self._cell_at(event.position())
+            self._sel_active = True
+            self.update()
+        elif event.button() == Qt.MouseButton.MiddleButton:
+            self.paste()
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802 (Qt signature)
+        if self._mouse_on:
+            if event.buttons() & Qt.MouseButton.LeftButton:
+                self._send_mouse(event, pressed=True)
+            return
+        if self._sel_active and (event.buttons() & Qt.MouseButton.LeftButton):
+            self._sel_end = self._cell_at(event.position())
+            self.update()
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802 (Qt signature)
+        if self._mouse_on:
+            if event.button() == Qt.MouseButton.LeftButton:
+                self._send_mouse(event, pressed=False)
+            return
+        if event.button() == Qt.MouseButton.LeftButton and self._sel_active:
+            self._sel_end = self._cell_at(event.position())
+            self.update()
+            text = self._selection_text()
+            if text:
+                self._copy_text(text)  # copy-on-select
+
+    def contextMenuEvent(self, event) -> None:  # noqa: N802 (Qt signature)
+        menu = QMenu(self)
+        act_copy = menu.addAction("Copy")
+        act_paste = menu.addAction("Paste")
+        chosen = menu.exec(event.globalPos())
+        if chosen is act_copy:
+            text = self._selection_text()
+            if text:
+                self._copy_text(text)
+        elif chosen is act_paste:
+            self.paste()
+
+    def _send_mouse(self, event, pressed: bool) -> None:
+        # SGR mouse encoding: ESC[<{button};{col};{row}M|m
+        btn_map = {
+            Qt.MouseButton.LeftButton: 0,
+            Qt.MouseButton.MiddleButton: 1,
+            Qt.MouseButton.RightButton: 2,
+        }
+        code = btn_map.get(event.button(), 3)
+        mods = event.modifiers()
+        if mods & Qt.KeyboardModifier.ShiftModifier:
+            code += 4
+        if mods & Qt.KeyboardModifier.AltModifier:
+            code += 8
+        if mods & Qt.KeyboardModifier.ControlModifier:
+            code += 16
+        row, col = self._cell_at(event.position())
+        final = "M" if pressed else "m"
+        self._pty.write(f"\x1b[<{code};{col + 1};{row + 1}{final}")
+
+    # --- selection / clipboard ----------------------------------------------
+    def has_selection(self) -> bool:
+        return self._sel_active and self._sel_start != self._sel_end
+
+    def _ordered_selection(self) -> Optional[tuple[tuple[int, int], tuple[int, int]]]:
+        if self._sel_start is None or self._sel_end is None:
+            return None
+        a, b = self._sel_start, self._sel_end
+        return (a, b) if a <= b else (b, a)
+
+    def _selection_ranges(self):
+        """Yield (row, col_start, col_end) inclusive for the current selection."""
+        ends = self._ordered_selection()
+        if ends is None:
+            return
+        (r1, c1), (r2, c2) = ends
+        cols = max(1, self._cols)
+        for r in range(r1, r2 + 1):
+            start = c1 if r == r1 else 0
+            end = c2 if r == r2 else cols - 1
+            yield r, start, end
+
+    def _selection_text(self) -> str:
+        with self._lock:
+            lines = self._screen.lines
+            columns = self._screen.columns
+            buffer = self._screen.buffer
+            parts = []
+            for r, c1, c2 in self._selection_ranges():
+                if r >= lines:
+                    break
+                c2 = min(c2, columns - 1)
+                row_text = "".join(buffer[r][c].data for c in range(c1, c2 + 1))
+                parts.append(row_text.rstrip())
+        return "\n".join(parts)
+
+    def _clear_selection(self) -> None:
+        self._sel_active = False
+        self._sel_start = self._sel_end = None
+        self.update()
+
+    def _copy_text(self, text: str) -> None:
+        QGuiApplication.clipboard().setText(text)
+
+    def paste(self) -> None:
+        text = QGuiApplication.clipboard().text()
+        if not text:
+            return
+        # terminals use CR, not LF
+        text = text.replace("\r\n", "\r").replace("\n", "\r")
+        if self._bracketed_paste:
+            text = f"\x1b[200~{text}\x1b[201~"
+        self._pty.write(text)
 
     def _encode_key(self, event) -> Optional[str]:
         key = event.key()
