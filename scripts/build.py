@@ -15,6 +15,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -29,7 +30,18 @@ def main() -> int:
         path = os.path.join(ROOT, folder)
         if os.path.isdir(path):
             print(f"Cleaning {path}")
-            shutil.rmtree(path)
+            try:
+                shutil.rmtree(path)
+            except OSError as exc:
+                # Windows sometimes keeps a transient handle on the folder
+                # (Explorer, antivirus). Retry once, then continue: PyInstaller
+                # overwrites the contents anyway.
+                print(f"  rmtree failed ({exc}); retrying...")
+                time.sleep(2)
+                try:
+                    shutil.rmtree(path)
+                except OSError:
+                    print(f"  could not fully remove {path}; continuing")
 
     spec = os.path.join(ROOT, "megacode.spec")
     cmd = [python, "-m", "PyInstaller", "--noconfirm", "--clean", spec]
