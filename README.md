@@ -11,6 +11,10 @@ Two launch modes:
 - **Separate windows** — the original mode: opens N Windows Terminal windows and
   tiles them across the monitor (handy if you'd rather use real WT windows).
 
+Each terminal can run **Claude Code**, **PowerShell**, **Command Prompt**, or a
+**custom command** — pick it at launch, and mix types later with the Add
+button's dropdown.
+
 Pick **2, 3, 4 or 6** instances; the grid shape is:
 
 | Instances | Layout |
