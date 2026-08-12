@@ -30,12 +30,21 @@ excludes = [
 ]
 # fmt: on
 
+# pywinpty ships compiled extensions / agent binaries that PyInstaller must bundle.
+from PyInstaller.utils.hooks import collect_all as _collect_all
+_datas, _binaries, _hiddenimports = [], [], []
+for _pkg in ("winpty", "pyte"):
+    _d, _b, _h = _collect_all(_pkg)
+    _datas += _d
+    _binaries += _b
+    _hiddenimports += _h
+
 a = Analysis(
     ["src/run.py"],
     pathex=["src"],
-    binaries=[],
-    datas=[],
-    hiddenimports=[],
+    binaries=_binaries,
+    datas=_datas,
+    hiddenimports=_hiddenimports,
     hookspath=[],
     runtime_hooks=[],
     excludes=excludes,
