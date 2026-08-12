@@ -22,3 +22,6 @@ Thumbs.db
 
 # Claude Code local settings
 .claude/
+
+# Generated dev artifacts
+docs/terminal_preview.png
