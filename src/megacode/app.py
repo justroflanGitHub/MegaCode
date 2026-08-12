@@ -214,7 +214,8 @@ class LauncherPage(QWidget):
         col.setSpacing(6)
         col.addWidget(QLabel("WORKING FOLDER", objectName="section"))
         line = QHBoxLayout()
-        self._path_edit = QLineEdit(os.getcwd())
+        default_cwd = r"D:\claude" if os.path.isdir(r"D:\claude") else os.getcwd()
+        self._path_edit = QLineEdit(default_cwd)
         browse = QPushButton("Browse…", objectName="secondary")
         browse.clicked.connect(self._browse)
         line.addWidget(self._path_edit, 1)
@@ -241,6 +242,12 @@ class LauncherPage(QWidget):
         self._custom_edit.setVisible(False)
         col.addWidget(self._custom_edit)
         row.addLayout(col, 1)
+        # default to Command Prompt (set after _custom_edit exists, so the
+        # change handler doesn't run against a half-built widget)
+        for i in range(self._run_combo.count()):
+            if self._run_combo.itemData(i) == "cmd":
+                self._run_combo.setCurrentIndex(i)
+                break
         return row
 
     def _on_run_changed(self, _index: int) -> None:
