@@ -238,6 +238,15 @@ class WorkspaceView(QWidget):
         tile.terminal.setFocus()
 
     def _rebuild(self) -> None:
+        # Clear existing stretches first: otherwise a column/row used by a
+        # previous (larger) layout keeps a non-zero stretch and reserves empty
+        # space (e.g. 4 terminals showing a phantom 3rd column from the earlier
+        # 3-terminal layout -> "grid of 6").
+        for r in range(self._grid.rowCount()):
+            self._grid.setRowStretch(r, 0)
+        for c in range(self._grid.columnCount()):
+            self._grid.setColumnStretch(c, 0)
+
         # remove widgets from the grid without destroying them
         while self._grid.count():
             item = self._grid.takeAt(0)
