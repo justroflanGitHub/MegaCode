@@ -211,7 +211,7 @@ class LauncherPage(QWidget):
         row.addWidget(QLabel("FONT", objectName="section"))
         self._font_spin = QSpinBox()
         self._font_spin.setRange(7, 22)
-        self._font_spin.setValue(11)
+        self._font_spin.setValue(12)
         self._font_spin.setFixedWidth(64)
         row.addWidget(self._font_spin)
         row.addSpacing(16)

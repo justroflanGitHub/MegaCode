@@ -9,6 +9,7 @@ inside this widget, so moving the widget moves the session.
 
 from __future__ import annotations
 
+import re
 import threading
 from typing import List, Optional
 
@@ -18,6 +19,15 @@ from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPalette
 from PySide6.QtWidgets import QWidget
 
 from .conpty import Pty
+
+# pyte misparses private/extended SGR sequences (e.g. Kitty's underline-style
+# "ESC[>4;2m") as plain SGR 4 (underline), so the whole frame ends up
+# "underlined". Windows Terminal ignores these, so we strip them. Standard SGR
+# (no < > = ? prefix) is never touched.
+_PRIVATE_SGR = re.compile(r"\x1b\[[<>=?][0-9;:]*m")
+# A trailing, possibly-incomplete numeric CSI -- held back so a private sequence
+# is never split across two reads (which would defeat the filter).
+_TRAILING_CSI = re.compile(r"\x1b\[[<>=?]?[0-9;:]*$")
 
 # --- theme & palette --------------------------------------------------------
 _DEFAULT_FG = "#d4d4d4"
@@ -65,8 +75,15 @@ class TerminalWidget(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
         self.setAutoFillBackground(False)
 
-        self._font = QFont("Consolas", font_size)
+        # Windows Terminal's default face is "Cascadia Mono"; use it (with
+        # fallbacks) so glyphs and metrics match what the user expects.
+        self._font = QFont("Cascadia Mono", font_size)
+        self._font.setFamilies(
+            ["Cascadia Mono", "Cascadia Code", "Cascadia Mono NF", "Consolas",
+             "DejaVu Sans Mono", "Courier New"]
+        )
         self._font.setStyleHint(QFont.StyleHint.Monospace)
+        self._font.setFixedPitch(True)
         metrics = QFontMetrics(self._font)
         self._cell_w = max(1, metrics.horizontalAdvance("M"))
         self._cell_h = max(1, metrics.lineSpacing())
@@ -76,6 +93,7 @@ class TerminalWidget(QWidget):
         self._lock = threading.Lock()
         self._screen = pyte.Screen(self._cols, self._rows)
         self._stream = pyte.Stream(self._screen)
+        self._pty_buf = ""
 
         self._pty = Pty(command, self._cols, self._rows, cwd=cwd)
         self._pty.start(self._on_output)
@@ -93,8 +111,18 @@ class TerminalWidget(QWidget):
 
     # --- PTY output -> pyte -> repaint --------------------------------------
     def _on_output(self, text: str) -> None:
-        with self._lock:
-            self._stream.feed(text)
+        # Buffer so a private SGR sequence is never split across reads, then
+        # strip the ones pyte misparses (see _PRIVATE_SGR).
+        buf = self._pty_buf + text
+        tail = _TRAILING_CSI.search(buf)
+        if tail:
+            ready, self._pty_buf = buf[: tail.start()], buf[tail.start():]
+        else:
+            ready, self._pty_buf = buf, ""
+        ready = _PRIVATE_SGR.sub("", ready)
+        if ready:
+            with self._lock:
+                self._stream.feed(ready)
         # signal crosses from the reader thread to the GUI thread (queued)
         self.update()
 
@@ -163,10 +191,13 @@ class TerminalWidget(QWidget):
             fg, bg = bg, fg
         if bg != self._default_bg:
             painter.fillRect(x, y, self._cell_w * len(run_chars), self._cell_h, bg)
+        # Only decorate runs that actually contain visible glyphs; underlining
+        # whitespace draws spurious full-width lines across empty cells.
+        has_text = any(ch != " " for ch in run_chars)
         f = QFont(self._font)
         if bold:
             f.setBold(True)
-        if underline:
+        if underline and has_text:
             f.setUnderline(True)
         painter.setFont(f)
         painter.setPen(fg)
@@ -192,9 +223,15 @@ class TerminalWidget(QWidget):
         text = event.text()
         ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
         alt = bool(mods & Qt.KeyboardModifier.AltModifier)
+        shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
 
         if ctrl and Qt.Key.Key_A <= key <= Qt.Key.Key_Z:
             return chr(key - Qt.Key.Key_A + 1)
+
+        # Shift+Tab cycles Claude Code modes (auto-accept / plan); must send
+        # the "back-tab" sequence, not a plain tab.
+        if shift and key == Qt.Key.Key_Tab:
+            return "\x1b[Z"
 
         special = {
             Qt.Key.Key_Return: "\r", Qt.Key.Key_Enter: "\r",
