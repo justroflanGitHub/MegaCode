@@ -18,11 +18,14 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QMenu,
     QPushButton,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
+from . import shells
 from .layouts import auto_shape, grid_positions
 from .terminal_widget import TerminalWidget
 
@@ -90,12 +93,15 @@ class TerminalTile(QFrame):
     swapRequested = Signal(int, int)  # (target_index, source_index)
     closeRequested = Signal(int)      # (index)
 
-    def __init__(self, index: int, command: str, cwd: str, font_size: int = 10) -> None:
+    def __init__(
+        self, index: int, command: str, cwd: str, font_size: int = 10, label: str = "term"
+    ) -> None:
         super().__init__()
         self.setObjectName("tile")
         self._index = index
         self._command = command
         self._cwd = cwd
+        self._label = label
         self._drop_target = False
 
         self.header = TileHeader(self)
@@ -118,10 +124,10 @@ class TerminalTile(QFrame):
 
     def set_index(self, index: int) -> None:
         self._index = index
-        self.header.title.setText(f"claude #{index + 1}")
+        self.header.title.setText(f"{self._label} #{index + 1}")
 
     def _on_terminal_finished(self) -> None:
-        self.header.title.setText(f"claude #{self._index + 1}  (exited)")
+        self.header.title.setText(f"{self._label} #{self._index + 1}  (exited)")
 
     # --- drag & drop (drop target) ------------------------------------------
     def dragEnterEvent(self, event) -> None:  # noqa: N802 (Qt signature)
@@ -165,6 +171,7 @@ class WorkspaceView(QWidget):
         self._command: Optional[str] = None
         self._cwd: Optional[str] = None
         self._font_size = 10
+        self._label = "term"
         self.tiles: List[TerminalTile] = []
 
         root = QVBoxLayout(self)
@@ -197,8 +204,17 @@ class WorkspaceView(QWidget):
         layout.addWidget(self._count_label)
         layout.addStretch(1)
 
-        self._add_btn = QPushButton("＋  Add terminal", objectName="toolbarBtn")
-        self._add_btn.clicked.connect(self.add_tile)
+        self._add_btn = QToolButton(objectName="toolbarBtn")
+        self._add_btn.setText("＋  Add")
+        self._add_btn.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+        add_menu = QMenu(self._add_btn)
+        for menu_label, kind in shells.RUN_KINDS:
+            if kind == "custom":
+                continue  # custom command is only available from the launcher
+            action = add_menu.addAction(menu_label)
+            action.triggered.connect(lambda _=False, k=kind: self.add_kind(k))
+        self._add_btn.setMenu(add_menu)
+        self._add_btn.clicked.connect(lambda: self.add_kind("claude"))
         layout.addWidget(self._add_btn)
 
         self._min_btn = QPushButton("—  Minimize", objectName="toolbarBtn")
@@ -212,18 +228,21 @@ class WorkspaceView(QWidget):
             window.showMinimized()
 
     # --- lifecycle ----------------------------------------------------------
-    def start(self, n: int, command: str, cwd: str, font_size: int = 10) -> None:
+    def start(
+        self, n: int, command: str, cwd: str, font_size: int = 10, label: str = "term"
+    ) -> None:
         self.cleanup()
         self._command = command
         self._cwd = cwd
         self._font_size = font_size
+        self._label = label
         for _ in range(n):
-            self._new_tile()
+            self._new_tile(command, label)
         self._focus_first()
 
-    def _new_tile(self) -> TerminalTile:
-        assert self._command and self._cwd is not None
-        tile = TerminalTile(len(self.tiles), self._command, self._cwd, self._font_size)
+    def _new_tile(self, command: str, label: str) -> TerminalTile:
+        assert self._cwd is not None
+        tile = TerminalTile(len(self.tiles), command, self._cwd, self._font_size, label)
         tile.swapRequested.connect(self._on_swap)
         tile.closeRequested.connect(self._on_close_tile)
         self.tiles.append(tile)
@@ -231,10 +250,14 @@ class WorkspaceView(QWidget):
         return tile
 
     @Slot()
-    def add_tile(self) -> None:
-        if not self._command or self._cwd is None:
+    def add_kind(self, kind: str) -> None:
+        """Add a terminal of the given run kind (claude/powershell/cmd)."""
+        if self._cwd is None:
             return
-        tile = self._new_tile()
+        command = shells.resolve(kind)
+        if not command:
+            return
+        tile = self._new_tile(command, shells.label_for(kind))
         tile.terminal.setFocus()
 
     def _rebuild(self) -> None:

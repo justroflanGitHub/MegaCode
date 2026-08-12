@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import logging
 import os
-import shutil
 import sys
 import tempfile
 import traceback
@@ -21,6 +20,7 @@ from PySide6.QtGui import QColor, QPainter, QPalette
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
+    QComboBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from . import shells
 from . import terminal as separate_terminal
 from .layouts import SUPPORTED, compute_layout
 from .workspace import WorkspaceView
@@ -83,6 +84,22 @@ QPushButton#secondary, QPushButton#toolbarBtn {{
     padding: 8px 14px; color: {TEXT};
 }}
 QPushButton#secondary:hover, QPushButton#toolbarBtn:hover {{ border: 1px solid {BORDER_HI}; }}
+QComboBox {{
+    background: {CARD}; border: 1px solid {BORDER}; border-radius: 8px;
+    padding: 6px 10px; color: {TEXT};
+}}
+QComboBox:hover {{ border: 1px solid {BORDER_HI}; }}
+QComboBox::drop-down {{ border: none; width: 22px; }}
+QComboBox QAbstractItemView {{
+    background: {CARD}; border: 1px solid {BORDER}; color: {TEXT};
+    selection-background-color: #2a2f3a; outline: 0;
+}}
+QToolButton#toolbarBtn {{
+    background: {CARD}; border: 1px solid {BORDER}; border-radius: 8px;
+    padding: 6px 12px; color: {TEXT};
+}}
+QToolButton#toolbarBtn:hover {{ border: 1px solid {BORDER_HI}; }}
+QToolButton#toolbarBtn::menu-button {{ border: none; width: 16px; }}
 QPushButton#launch {{
     background: {ACCENT}; border: none; border-radius: 10px;
     padding: 14px; color: #1a120e; font-size: 14px; font-weight: 700;
@@ -134,8 +151,8 @@ class LayoutPreview(QWidget):
 class LauncherPage(QWidget):
     """Choose instance count, folder and launch mode."""
 
-    launch_workspace = Signal(int, str, int)   # (n, cwd, font_size)
-    launch_separate = Signal(int, str, int)    # (n, cwd, gap)
+    launch_workspace = Signal(int, str, int, str, str)  # (n, cwd, font_size, command, label)
+    launch_separate = Signal(int, str, int)             # (n, cwd, gap)
 
     def __init__(self) -> None:
         super().__init__(objectName="root")
@@ -148,6 +165,7 @@ class LauncherPage(QWidget):
         layout.addWidget(self._count_row())
         layout.addWidget(self._preview(), 1)
         layout.addLayout(self._folder_row())
+        layout.addLayout(self._run_row())
         layout.addLayout(self._options_row())
         layout.addStretch(1)
         layout.addWidget(self._primary_button())
@@ -205,6 +223,30 @@ class LauncherPage(QWidget):
         row.addLayout(col, 1)
         return row
 
+    def _run_row(self) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        col = QVBoxLayout()
+        col.setSpacing(6)
+        col.addWidget(QLabel("RUN", objectName="section"))
+        line = QHBoxLayout()
+        self._run_combo = QComboBox()
+        for menu_label, kind in shells.RUN_KINDS:
+            self._run_combo.addItem(menu_label, kind)
+        self._run_combo.currentIndexChanged.connect(self._on_run_changed)
+        line.addWidget(self._run_combo, 1)
+        col.addLayout(line)
+        self._custom_edit = QLineEdit()
+        self._custom_edit.setPlaceholderText("command, e.g. pwsh -NoLogo")
+        self._custom_edit.setVisible(False)
+        col.addWidget(self._custom_edit)
+        row.addLayout(col, 1)
+        return row
+
+    def _on_run_changed(self, _index: int) -> None:
+        kind = self._run_combo.currentData()
+        self._custom_edit.setVisible(kind == "custom")
+
     def _options_row(self) -> QHBoxLayout:
         row = QHBoxLayout()
         row.setSpacing(16)
@@ -259,8 +301,21 @@ class LauncherPage(QWidget):
 
     def _emit_workspace(self) -> None:
         cwd = self._validated_cwd()
-        if cwd:
-            self.launch_workspace.emit(self._count, cwd, self._font_spin.value())
+        if not cwd:
+            return
+        kind = self._run_combo.currentData()
+        custom = self._custom_edit.text() if kind == "custom" else None
+        command = shells.resolve(kind, custom)
+        if not command:
+            QMessageBox.warning(
+                self, "MegaCode",
+                f"Couldn't resolve a command to run for '{self._run_combo.currentText()}'.",
+            )
+            return
+        label = shells.label_for(kind)
+        if kind == "custom" and custom:
+            label = os.path.basename(custom.split()[0]) or "custom"
+        self.launch_workspace.emit(self._count, cwd, self._font_spin.value(), command, label)
 
     def _emit_separate(self) -> None:
         cwd = self._validated_cwd()
@@ -345,13 +400,14 @@ class MainWindow(QMainWindow):
         self.move(fg.topLeft())
 
     # --- actions ------------------------------------------------------------
-    def _on_launch_workspace(self, n: int, cwd: str, font_size: int) -> None:
-        claude = shutil.which("claude") or shutil.which("claude.exe")
-        if not claude:
-            QMessageBox.critical(self, "MegaCode", "claude was not found on PATH.")
+    def _on_launch_workspace(
+        self, n: int, cwd: str, font_size: int, command: str, label: str
+    ) -> None:
+        if not command:
+            QMessageBox.critical(self, "MegaCode", "No command to run.")
             return
         try:
-            self._workspace.start(n, claude, cwd, font_size=font_size)
+            self._workspace.start(n, command, cwd, font_size=font_size, label=label)
         except Exception as exc:  # noqa: BLE001
             log.exception("workspace start failed")
             QMessageBox.critical(self, "MegaCode", f"Failed to start terminals:\n{exc}")
