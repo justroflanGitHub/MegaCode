@@ -11,8 +11,8 @@ from __future__ import annotations
 import logging
 from typing import List, Optional
 
-from PySide6.QtCore import QMimeData, QObject, QPoint, Qt, Signal, Slot
-from PySide6.QtGui import QDrag, QCursor
+from PySide6.QtCore import QMimeData, QPoint, Qt, Signal, Slot
+from PySide6.QtGui import QDrag
 from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,

@@ -10,7 +10,7 @@ inside this widget, so moving the widget moves the session.
 from __future__ import annotations
 
 import threading
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import pyte
 from PySide6.QtCore import Qt, Signal
