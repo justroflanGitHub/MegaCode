@@ -254,6 +254,11 @@ class TerminalWidget(QWidget):
         painter.fillRect(x, y, self._cell_w, self._cell_h, fg)
 
     # --- input --------------------------------------------------------------
+    def focusNextPrevChild(self, _next: bool) -> bool:  # noqa: N802 (Qt signature)
+        # Keep Tab / Shift+Tab inside the terminal (they drive the app, e.g.
+        # Claude Code's mode cycling) instead of moving focus to other widgets.
+        return False
+
     def keyPressEvent(self, event) -> None:  # noqa: N802 (Qt signature)
         mods = event.modifiers()
         key = event.key()
@@ -418,8 +423,9 @@ class TerminalWidget(QWidget):
             return chr(key - Qt.Key.Key_A + 1)
 
         # Shift+Tab cycles Claude Code modes (auto-accept / plan); must send
-        # the "back-tab" sequence, not a plain tab.
-        if shift and key == Qt.Key.Key_Tab:
+        # the "back-tab" sequence, not a plain tab. Qt may deliver it as either
+        # Key_Tab + Shift or Key_Backtab.
+        if key == Qt.Key.Key_Backtab or (shift and key == Qt.Key.Key_Tab):
             return "\x1b[Z"
 
         special = {

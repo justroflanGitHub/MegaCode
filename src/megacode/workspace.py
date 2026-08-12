@@ -220,12 +220,25 @@ class WorkspaceView(QWidget):
         self._min_btn = QPushButton("—  Minimize", objectName="toolbarBtn")
         self._min_btn.clicked.connect(self._minimize_window)
         layout.addWidget(self._min_btn)
+
+        self._fs_btn = QPushButton("⛶  Fullscreen", objectName="toolbarBtn")
+        self._fs_btn.clicked.connect(self._toggle_fullscreen)
+        layout.addWidget(self._fs_btn)
         return bar
 
     def _minimize_window(self) -> None:
         window = self.window()
         if window is not None:
             window.showMinimized()
+
+    def _toggle_fullscreen(self) -> None:
+        window = self.window()
+        if window is None:
+            return
+        if window.isFullScreen():
+            window.showNormal()
+        else:
+            window.showFullScreen()
 
     # --- lifecycle ----------------------------------------------------------
     def start(

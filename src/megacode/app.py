@@ -16,7 +16,7 @@ import traceback
 from typing import Optional
 
 from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QColor, QPainter, QPalette
+from PySide6.QtGui import QColor, QKeySequence, QPainter, QPalette, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -371,24 +371,31 @@ class MainWindow(QMainWindow):
         self._stack.addWidget(self._workspace)  # index 1
 
         self.setStyleSheet(QSS)
+        QShortcut(QKeySequence("F11"), self, activated=self._toggle_fullscreen)
         self._enter_launcher()
+
+    def _toggle_fullscreen(self) -> None:
+        if self.isFullScreen():
+            self.showNormal()
+        else:
+            self.showFullScreen()
 
     # --- navigation ---------------------------------------------------------
     def _enter_launcher(self) -> None:
+        if self.isMaximized() or self.isFullScreen():
+            self.showNormal()
         self._stack.setCurrentWidget(self._launcher)
         self.setFixedSize(520, 660)
         self._center()
 
     def _enter_workspace(self) -> None:
+        # Undo the launcher's fixed size so the window can be resized /
+        # maximized / fullscreened.
+        self.setMinimumSize(360, 260)
         self.setMaximumSize(16777215, 16777215)
-        screen = QApplication.primaryScreen()
-        geo = screen.availableGeometry() if screen else None
-        if geo is not None:
-            self.resize(int(geo.width() * 0.92), int(geo.height() * 0.92))
-        else:
-            self.resize(1500, 900)
         self._stack.setCurrentWidget(self._workspace)
-        self._center()
+        if not (self.isMaximized() or self.isFullScreen()):
+            self.showMaximized()
 
     def _center(self) -> None:
         screen = QApplication.primaryScreen()
