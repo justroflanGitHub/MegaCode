@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="200" viewBox="0 0 640 200" font-family="Segoe UI, Arial, sans-serif">
+  <rect width="640" height="200" fill="#0e1014"/>
+  <!-- 2 columns -->
+  <g transform="translate(20,40)">
+    <text x="55" y="-8" fill="#8a93a3" font-size="13" text-anchor="middle">2</text>
+    <rect x="0"  y="0" width="54" height="100" rx="4" fill="#3a3f4b"/>
+    <rect x="58" y="0" width="54" height="100" rx="4" fill="#3a3f4b" stroke="#d97757" stroke-width="1.5"/>
+  </g>
+  <!-- 3 columns -->
+  <g transform="translate(170,40)">
+    <text x="80" y="-8" fill="#8a93a3" font-size="13" text-anchor="middle">3</text>
+    <rect x="0"  y="0" width="52" height="100" rx="4" fill="#3a3f4b"/>
+    <rect x="56" y="0" width="52" height="100" rx="4" fill="#3a3f4b"/>
+    <rect x="112" y="0" width="52" height="100" rx="4" fill="#3a3f4b" stroke="#d97757" stroke-width="1.5"/>
+  </g>
+  <!-- 4 grid -->
+  <g transform="translate(330,40)">
+    <text x="55" y="-8" fill="#8a93a3" font-size="13" text-anchor="middle">4</text>
+    <rect x="0"  y="0"  width="54" height="49" rx="4" fill="#3a3f4b"/>
+    <rect x="58" y="0"  width="54" height="49" rx="4" fill="#3a3f4b" stroke="#d97757" stroke-width="1.5"/>
+    <rect x="0"  y="53" width="54" height="49" rx="4" fill="#3a3f4b" stroke="#d97757" stroke-width="1.5"/>
+    <rect x="58" y="53" width="54" height="49" rx="4" fill="#3a3f4b"/>
+  </g>
+  <!-- 6 grid -->
+  <g transform="translate(470,40)">
+    <text x="80" y="-8" fill="#8a93a3" font-size="13" text-anchor="middle">6</text>
+    <rect x="0"   y="0"  width="52" height="49" rx="4" fill="#3a3f4b"/>
+    <rect x="56"  y="0"  width="52" height="49" rx="4" fill="#3a3f4b" stroke="#d97757" stroke-width="1.5"/>
+    <rect x="112" y="0"  width="52" height="49" rx="4" fill="#3a3f4b"/>
+    <rect x="0"   y="53" width="52" height="49" rx="4" fill="#3a3f4b"/>
+    <rect x="56"  y="53" width="52" height="49" rx="4" fill="#3a3f4b"/>
+    <rect x="112" y="53" width="52" height="49" rx="4" fill="#3a3f4b" stroke="#d97757" stroke-width="1.5"/>
+  </g>
+  <text x="320" y="185" fill="#8a93a3" font-size="12" text-anchor="middle">MegaCode tiling layouts</text>
+</svg>
