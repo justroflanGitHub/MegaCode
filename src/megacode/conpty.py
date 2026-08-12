@@ -10,13 +10,29 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import os
+import shlex
+import shutil
+import subprocess
 import threading
 import time
-from typing import Callable, Optional
+from typing import Callable, List, Optional
 
 import winpty
 
 log = logging.getLogger("megacode")
+
+
+def _to_argv(command) -> List[str]:
+    """Parse a command string into argv (executable + arguments)."""
+    if isinstance(command, str):
+        return shlex.split(command, posix=False)
+    return list(command)
+
+
+def _build_env() -> str:
+    """Build the ``\\0``-separated environment block pywinpty expects."""
+    return "\0".join(f"{k}={v}" for k, v in os.environ.items()) + "\0"
 
 _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 _kernel32.OpenProcess.argtypes = [ctypes.c_uint64, ctypes.c_int, ctypes.c_uint32]
@@ -42,8 +58,18 @@ class Pty:
     ) -> None:
         if cols < 1 or rows < 1:
             raise ValueError("cols and rows must be >= 1")
+        argv = _to_argv(command)
+        if not argv:
+            raise ValueError("empty command")
+        # pywinpty takes the executable and its args separately. The args must
+        # be passed as a *leading-space* command line that still includes
+        # argv[0], and env must be supplied at the same time (without env,
+        # pywinpty silently drops the args).
+        exe = shutil.which(argv[0]) or argv[0].strip('"')
+        env = _build_env()
+        cmdline = " " + subprocess.list2cmdline(argv)
         self._pty = winpty.PTY(cols, rows)
-        if not self._pty.spawn(command, cwd=cwd):
+        if not self._pty.spawn(exe, cmdline, cwd=cwd, env=env):
             raise RuntimeError(f"Failed to spawn: {command}")
         self._pid = int(self._pty.pid)
         self._on_output: Optional[Callable[[str], None]] = None
