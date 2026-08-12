@@ -16,6 +16,7 @@ function guarantees that the returned cells exactly tile the supplied area
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import List, Tuple
 
@@ -74,6 +75,28 @@ def _distribute(total: int, count: int, gap: int) -> List[int]:
     for i in range(remainder):
         sizes[i] += 1
     return sizes
+
+
+def auto_shape(n: int) -> Tuple[int, int]:
+    """Return a sensible ``(columns, rows)`` grid for any ``n >= 1``.
+
+    The predefined shapes are used for the UI preset counts (2/3/4/6); for any
+    other count (e.g. after adding/removing a terminal) a near-square grid is
+    derived so new terminals always tile cleanly.
+    """
+    if n in SHAPES:
+        return SHAPES[n]
+    if n <= 1:
+        return (1, 1)
+    cols = math.ceil(math.sqrt(n))
+    rows = math.ceil(n / cols)
+    return (cols, rows)
+
+
+def grid_positions(n: int) -> List[Tuple[int, int]]:
+    """Return ``n`` ``(row, col)`` positions in a grid, reading order."""
+    cols, _rows = auto_shape(n)
+    return [(i // cols, i % cols) for i in range(n)]
 
 
 def compute_layout(n: int, area: Rect, gap: int = 6) -> List[Rect]:
