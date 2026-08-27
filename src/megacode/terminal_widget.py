@@ -14,9 +14,10 @@ import threading
 from typing import List, Optional
 
 import pyte
-from PySide6.QtCore import Qt, Signal
+import pyte.modes
+from PySide6.QtCore import QPointF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QGuiApplication, QPainter, QPalette
-from PySide6.QtWidgets import QMenu, QWidget
+from PySide6.QtWidgets import QWidget
 
 from .conpty import Pty
 
@@ -34,6 +35,16 @@ _PRIV_MODE = re.compile(r"\x1b\[\?([0-9;]+)([hl])")
 _BRACKETED_PASTE = 2004
 _MOUSE_TRACKING = {1000, 1002, 1003}  # X10 / button-event / any-event
 _SGR_MOUSE = 1006
+
+#: How many scrolled-off lines to retain so they can be scrolled back to with
+#: the mouse wheel (this is what cmd/powershell "lose the top output" needs).
+_HISTORY_LINES = 10000
+#: Lines scrolled per wheel notch (matches Windows Terminal's default feel).
+_WHEEL_LINES = 3
+#: Auto-scroll cadence while a selection drag is held past the top/bottom edge.
+_AUTOSCROLL_INTERVAL_MS = 50
+#: Cap on lines per auto-scroll tick, however far the pointer overshoots.
+_AUTOSCROLL_MAX_LINES = 8
 
 # --- theme & palette --------------------------------------------------------
 _DEFAULT_FG = "#d4d4d4"
@@ -61,6 +72,54 @@ def _resolve_color(spec: str, default: QColor) -> QColor:
     if len(spec) == 6 and all(ch in _HEX_DIGITS for ch in spec):
         return QColor("#" + spec)
     return default
+
+
+class _ConPtyScreen(pyte.HistoryScreen):
+    """HistoryScreen plus the two ops pyte 0.8.2 is missing for TUIs.
+
+    ``CSI Ps S`` / ``CSI Ps T`` (scroll the DECSTBM region up/down) are what
+    full-screen editors (nano's smooth scroll, vim's ``scrolljump``) use to
+    shift their edit area; stock pyte silently ignores both, leaving part of
+    the region stale while the freshly drawn lines move. These follow the
+    margin semantics of pyte's own ``index`` / ``reverse_index``.
+    """
+
+    def _region(self) -> tuple[int, int]:
+        if self.margins:
+            top, bottom = self.margins
+        else:
+            top, bottom = 0, self.lines - 1
+        return top, bottom
+
+    def su(self, count: int | None = None) -> None:
+        """``CSI Ps S`` -- scroll the margins region up by ``Ps`` lines."""
+        top, bottom = self._region()
+        n = min(max(count or 1, 1), bottom - top + 1)
+        for _ in range(n):
+            if top == 0:
+                # a full-screen scroll retires the top line into scrollback,
+                # exactly like HistoryScreen.index does
+                self.history.top.append(self.buffer[top])
+            for y in range(top, bottom):
+                self.buffer[y] = self.buffer[y + 1]
+            self.buffer.pop(bottom, None)
+        self.dirty.update(range(self.lines))
+
+    def sd(self, count: int | None = None) -> None:
+        """``CSI Ps T`` -- scroll the margins region down by ``Ps`` lines."""
+        top, bottom = self._region()
+        n = min(max(count or 1, 1), bottom - top + 1)
+        for _ in range(n):
+            for y in range(bottom, top, -1):
+                self.buffer[y] = self.buffer[y - 1]
+            self.buffer.pop(top, None)
+        self.dirty.update(range(self.lines))
+
+
+class _ConPtyStream(pyte.Stream):
+    """A Stream that also dispatches ``CSI S``/``CSI T`` to su/sd."""
+
+    csi = {**pyte.Stream.csi, "S": "su", "T": "sd"}
 
 
 class TerminalWidget(QWidget):
@@ -97,8 +156,19 @@ class TerminalWidget(QWidget):
 
         self._cols, self._rows = 80, 24
         self._lock = threading.Lock()
-        self._screen = pyte.Screen(self._cols, self._rows)
-        self._stream = pyte.Stream(self._screen)
+        # HistoryScreen keeps scrolled-off lines in ``history.top`` so the user
+        # can scroll back to them with the mouse wheel -- without it, pyte drops
+        # everything past the visible grid (cmd/powershell "lost top output").
+        self._screen = _ConPtyScreen(
+            self._cols, self._rows, history=_HISTORY_LINES
+        )
+        # ConPTY's re-emitted stream uses the Windows console's cooked newline
+        # semantics: a bare LF moves to the next row AND column 0 (verified
+        # against nano 8.5: "\n<ESC>[2dline-0000\n<ESC>[3d..." with zero CRLFs).
+        # pyte's VT-strict LF keeps the column, which shears every TUI frame;
+        # LNM makes pyte's linefeed do index + carriage return, like WT.
+        self._screen.mode.add(pyte.modes.LNM)
+        self._stream = _ConPtyStream(self._screen)
         self._pty_buf = ""
 
         self._pty = Pty(command, self._cols, self._rows, cwd=cwd)
@@ -110,8 +180,28 @@ class TerminalWidget(QWidget):
         self._sel_active = False
         self._sel_start: Optional[tuple[int, int]] = None
         self._sel_end: Optional[tuple[int, int]] = None
+        # True only while the left button is held on a selection drag. Only
+        # then may the view scroll without dropping the selection (the
+        # auto-scroll below needs exactly that).
+        self._sel_dragging = False
+        # auto-scroll state while the drag is held beyond the top/bottom edge
+        self._autoscroll_dir = 0          # -1 = up into history, +1 = down
+        self._autoscroll_lines = 0        # lines per tick (speed ~ overshoot)
+        self._autoscroll_pos: Optional[QPointF] = None
+        self._autoscroll_timer = QTimer(self)
+        self._autoscroll_timer.setInterval(_AUTOSCROLL_INTERVAL_MS)
+        self._autoscroll_timer.timeout.connect(self._autoscroll_tick)
         # private modes parsed from the output stream
         self._priv_modes: set[int] = set()
+        # scrollback: _scroll_offset is the number of lines the viewport is
+        # scrolled up from the live bottom (0 == following new output).
+        # _view_top is the combined (history+buffer) index of the top visible
+        # row, recomputed each paint and used to resolve selections.
+        self._scroll_offset = 0
+        self._view_top = 0
+        # last seen history length, used to freeze the view on the same lines
+        # when new output arrives while scrolled up
+        self._last_hist_len = 0
         palette = self.palette()
         palette.setColor(QPalette.ColorRole.Window, self._default_bg)
         palette.setColor(QPalette.ColorRole.Base, self._default_bg)
@@ -161,28 +251,64 @@ class TerminalWidget(QWidget):
         return bool(self._priv_modes & _MOUSE_TRACKING)
 
     # --- painting -----------------------------------------------------------
+    def _build_view(self) -> tuple[list[list], int]:
+        """Snapshot the visible rows, honouring the current scroll offset.
+
+        Returns ``(rows_of_chars, columns)``. Each row is a list of pyte ``Char``
+        cells for the grid width. Must be called under ``self._lock``. Also
+        updates ``self._view_top`` to the combined (history+buffer) index of the
+        first returned row, so selection code can map viewport rows back to the
+        right line.
+        """
+        screen = self._screen
+        hist = screen.history.top
+        hist_len = len(hist)
+        buf_lines = screen.lines
+        columns = screen.columns
+        buffer = screen.buffer
+        total = hist_len + buf_lines
+
+        view_h = max(1, min(self._rows_for_height(), buf_lines))
+        offset = self._effective_offset(hist_len)
+        # persist the freeze so wheel/clamp see the updated offset
+        self._scroll_offset = offset
+        self._last_hist_len = hist_len
+        bottom = total - offset                       # combined idx, exclusive
+        top = max(0, bottom - view_h)
+        self._view_top = top
+
+        blank = screen.default_char
+        rows: list[list] = []
+        for idx in range(top, top + view_h):
+            if idx >= total:
+                rows.append([blank] * columns)
+            elif idx < hist_len:
+                line = hist[idx]
+                rows.append([line[c] for c in range(columns)])
+            else:
+                line = buffer[idx - hist_len]
+                rows.append([line[c] for c in range(columns)])
+        return rows, columns
+
     def paintEvent(self, _event) -> None:  # noqa: N802 (Qt signature)
         painter = QPainter(self)
         painter.fillRect(self.rect(), self._default_bg)
 
         with self._lock:
-            lines = self._screen.lines
-            columns = self._screen.columns
-            buffer = self._screen.buffer
+            snapshot, columns = self._build_view()
             cursor_x = self._screen.cursor.x
             cursor_y = self._screen.cursor.y
             cursor_hidden = self._screen.cursor.hidden
-            # snapshot immutable Char references; safe to use after unlock
-            snapshot = [
-                [buffer[r][c] for c in range(columns)] for r in range(lines)
-            ]
+            # the live cursor lives in the buffer, so it is only on-screen when
+            # we are following new output (offset 0); then viewport row == cursor_y
+            cursor_in_view = self._scroll_offset == 0
 
         painter.setFont(self._font)
-        for row in range(min(lines, self._rows_for_height())):
-            chars = snapshot[row] if row < len(snapshot) else []
+        for row, chars in enumerate(snapshot):
             self._draw_row(painter, row, chars, columns)
 
-        if not cursor_hidden and not self._dead and 0 <= cursor_y < lines and 0 <= cursor_x < columns:
+        if (not cursor_hidden and not self._dead and cursor_in_view
+                and 0 <= cursor_y < len(snapshot) and 0 <= cursor_x < columns):
             self._draw_cursor(painter, cursor_x, cursor_y, snapshot[cursor_y][cursor_x])
 
         self._draw_selection(painter)
@@ -266,6 +392,9 @@ class TerminalWidget(QWidget):
         shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
 
         # Copy / paste (Windows-style: Ctrl+Shift+C/V, Ctrl+Ins / Shift+Ins).
+        # Handled BEFORE scrolling to the bottom so a selection made while
+        # scrolled back copies the lines the user actually highlighted, not the
+        # live-bottom rows.
         copy_combo = (ctrl and shift and key == Qt.Key.Key_C) or (ctrl and key == Qt.Key.Key_Insert)
         paste_combo = (ctrl and key == Qt.Key.Key_V) or (shift and key == Qt.Key.Key_Insert)
         if copy_combo:
@@ -282,6 +411,9 @@ class TerminalWidget(QWidget):
             self._clear_selection()
             return
 
+        # Genuine input returns to the live prompt (input follows the bottom of
+        # the buffer, not the scrolled-back view).
+        self._scroll_to_bottom()
         seq = self._encode_key(event)
         if seq:
             self._pty.write(seq)
@@ -296,13 +428,28 @@ class TerminalWidget(QWidget):
 
     def mousePressEvent(self, event) -> None:  # noqa: N802 (Qt signature)
         if self._mouse_on:
+            if event.button() == Qt.MouseButton.LeftButton:
+                # A press while the app tracks the mouse can never be part of
+                # a selection drag; clear any state left over from one.
+                self._sel_dragging = False
+                self._stop_autoscroll()
             self._send_mouse(event, pressed=True)
             return
-        if event.button() == Qt.MouseButton.LeftButton:
+        button = event.button()
+        if button == Qt.MouseButton.LeftButton:
             self._sel_start = self._sel_end = self._cell_at(event.position())
             self._sel_active = True
+            self._sel_dragging = True
             self.update()
-        elif event.button() == Qt.MouseButton.MiddleButton:
+        elif button == Qt.MouseButton.RightButton:
+            # Windows console "QuickEdit": right-click copies the selection if
+            # there is one, otherwise pastes.
+            if self.has_selection():
+                self._copy_text(self._selection_text())
+                self._clear_selection()
+            else:
+                self.paste()
+        elif button == Qt.MouseButton.MiddleButton:
             self.paste()
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802 (Qt signature)
@@ -312,9 +459,18 @@ class TerminalWidget(QWidget):
             return
         if self._sel_active and (event.buttons() & Qt.MouseButton.LeftButton):
             self._sel_end = self._cell_at(event.position())
+            self._update_autoscroll(event.position())
             self.update()
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802 (Qt signature)
+        if event.button() == Qt.MouseButton.LeftButton:
+            # End the drag on EVERY left release -- including when the app
+            # turned mouse tracking on mid-hold (its release is forwarded
+            # below) and when the selection was already cleared mid-drag
+            # (right-click copy). Otherwise the auto-scroll timer outlives
+            # the button that started it.
+            self._sel_dragging = False
+            self._stop_autoscroll()
         if self._mouse_on:
             if event.button() == Qt.MouseButton.LeftButton:
                 self._send_mouse(event, pressed=False)
@@ -322,24 +478,179 @@ class TerminalWidget(QWidget):
         if event.button() == Qt.MouseButton.LeftButton and self._sel_active:
             self._sel_end = self._cell_at(event.position())
             self.update()
-            text = self._selection_text()
-            if text:
-                self._copy_text(text)  # copy-on-select
+            # No copy-on-select: the user copies explicitly with right-click,
+            # like the classic cmd console.
+
+    def hideEvent(self, event) -> None:  # noqa: N802 (Qt signature)
+        # A tile can be hidden mid-drag (closed / swapped away); the implicit
+        # mouse grab then ends without a release, so stop the auto-scroll here.
+        self._sel_dragging = False
+        self._stop_autoscroll()
+        super().hideEvent(event)
 
     def contextMenuEvent(self, event) -> None:  # noqa: N802 (Qt signature)
-        menu = QMenu(self)
-        act_copy = menu.addAction("Copy")
-        act_paste = menu.addAction("Paste")
-        chosen = menu.exec(event.globalPos())
-        if chosen is act_copy:
-            text = self._selection_text()
-            if text:
-                self._copy_text(text)
-        elif chosen is act_paste:
-            self.paste()
+        # Swallow the native menu: the right button drives QuickEdit copy/paste.
+        event.accept()
+
+    def wheelEvent(self, event) -> None:  # noqa: N802 (Qt signature)
+        if self._mouse_on:
+            # App is tracking the mouse: forward the wheel as SGR mouse events so
+            # mouse-aware TUIs (less, pagers, claude's scrollback) scroll themselves.
+            self._send_wheel(event)
+            return
+        delta = event.angleDelta().y()
+        if delta == 0:
+            pd = event.pixelDelta().y()
+            delta = pd * 8 if pd else 0
+        if delta == 0:
+            event.ignore()
+            return
+        page = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+        step = self._rows if page else _WHEEL_LINES
+        notches = abs(delta) // 120 or 1
+        self._scroll_by(notches * step if delta > 0 else -(notches * step))
+
+    def _send_wheel(self, event) -> None:
+        delta = event.angleDelta().y() or (event.pixelDelta().y() * 8)
+        if delta == 0:
+            return
+        code = 64 if delta > 0 else 65  # SGR mouse: button wheel up / down
+        mods = event.modifiers()
+        if mods & Qt.KeyboardModifier.ShiftModifier:
+            code += 4
+        if mods & Qt.KeyboardModifier.AltModifier:
+            code += 8
+        if mods & Qt.KeyboardModifier.ControlModifier:
+            code += 16
+        row, col = self._cell_at(event.position())
+        self._pty.write(self._mouse_seq(code, col, row, pressed=True))
+
+    # --- selection auto-scroll ----------------------------------------------
+    def _autoscroll_params(self, pos) -> tuple[int, int]:
+        """``(direction, lines_per_tick)`` for a drag position.
+
+        Direction -1 = the pointer is above the widget (scroll up into
+        history), +1 = below it (scroll down), 0 = inside: no auto-scroll.
+        The further past the edge, the faster -- one extra line per row of
+        overshoot, capped so a fling across the window stays sane.
+        """
+        if pos.y() < 0:
+            over = -pos.y()
+            return -1, max(1, min(_AUTOSCROLL_MAX_LINES, int(over) // self._cell_h + 1))
+        if pos.y() > self.height():
+            over = pos.y() - self.height()
+            return 1, max(1, min(_AUTOSCROLL_MAX_LINES, int(over) // self._cell_h + 1))
+        return 0, 0
+
+    def _update_autoscroll(self, pos) -> None:
+        if not self._sel_dragging:
+            return
+        self._autoscroll_pos = pos
+        self._autoscroll_dir, self._autoscroll_lines = self._autoscroll_params(pos)
+        if self._autoscroll_dir == 0:
+            self._autoscroll_timer.stop()
+        elif not self._autoscroll_timer.isActive():
+            # Only start when idle: restarting on every move would starve the
+            # timer while the user drags along an edge (moves every few ms).
+            self._autoscroll_timer.start()
+
+    def _autoscroll_tick(self) -> None:
+        if (not self._sel_dragging or self._autoscroll_dir == 0
+                or self._autoscroll_pos is None):
+            self._stop_autoscroll()
+            return
+        # -dir: holding above the top edge (-1) scrolls up (offset grows);
+        # holding below the bottom edge (+1) scrolls back down toward the
+        # live prompt (offset shrinks, clamped at 0 by _scroll_by).
+        self._scroll_by(-self._autoscroll_dir * self._autoscroll_lines)
+        # Re-pin the dragged end to the edge the pointer is beyond, so the
+        # selection extends through every line the view scrolls past even
+        # while the mouse itself no longer moves.
+        self._sel_end = self._cell_at(self._autoscroll_pos)
+        self.update()
+
+    def _stop_autoscroll(self) -> None:
+        self._autoscroll_timer.stop()
+        self._autoscroll_dir = 0
+        self._autoscroll_lines = 0
+        self._autoscroll_pos = None
+
+    # --- scrollback ---------------------------------------------------------
+    def _history_len(self) -> int:
+        with self._lock:
+            return len(self._screen.history.top)
+
+    def _effective_offset(self, hist_len: int) -> int:
+        """The scroll offset after the freeze-on-output adjustment.
+
+        When the view is scrolled up and new output has arrived since the last
+        paint, the offset grows to keep the same lines anchored (real-terminal
+        behaviour). Computed WITHOUT mutating state so both _build_view (which
+        persists it) and _selection_text (read-only copy) resolve to the exact
+        same view the user sees.
+        """
+        offset = min(self._scroll_offset, hist_len)
+        if self._scroll_offset > 0:
+            growth = hist_len - self._last_hist_len
+            if growth > 0:
+                offset = min(self._scroll_offset + growth, hist_len)
+        return offset
+
+    def _scroll_by(self, lines: int) -> None:
+        """Scroll the viewport; positive = up into history, negative = down."""
+        hist_len = self._history_len()
+        # Absorb any history growth since the last paint (the freeze) into
+        # the base BEFORE computing the re-anchor delta. At the offset clamps
+        # that growth is either not real view movement (pinned at the top of
+        # history -- the next paint re-pins the view, so shifting the anchor
+        # by it drifts the selection onto neighbouring lines) or is missing
+        # from a plain offset delta (jumping to the bottom skips the freeze,
+        # so the view moves by the growth too). Basing everything on the
+        # effective offset makes the delta exactly the commanded movement.
+        base = self._effective_offset(hist_len)
+        self._scroll_offset = base
+        self._last_hist_len = hist_len
+        new_offset = max(0, min(base + lines, hist_len))
+        if new_offset == base:
+            return
+        delta = new_offset - base
+        self._scroll_offset = new_offset
+        if self._sel_dragging and self._sel_start is not None and self._sel_end is not None:
+            # Mid-drag (auto-scroll): selection coordinates are
+            # viewport-relative, so re-anchor both ends to their content.
+            # The view moved ``delta`` lines, which shifts the same content
+            # ``delta`` rows down the viewport (positive delta = scrolled up).
+            self._sel_start = (self._sel_start[0] + delta, self._sel_start[1])
+            self._sel_end = (self._sel_end[0] + delta, self._sel_end[1])
+        else:
+            # Outside a drag: drop the selection -- its viewport-relative
+            # coordinates would resolve against the wrong lines after the move.
+            self._clear_selection()
+        self.update()
+
+    def _scroll_to_bottom(self) -> None:
+        # Jump to the live bottom from wherever the view REALLY is: base the
+        # jump on the effective offset (freeze included) so it always lands
+        # at 0. _scroll_by applies the same invariant as everywhere else:
+        # clear the selection outside a drag, re-anchor it during one.
+        self._scroll_by(-self._effective_offset(self._history_len()))
+
+    def _mouse_seq(self, code: int, col: int, row: int, pressed: bool) -> str:
+        """Encode a mouse event using the app's negotiated encoding.
+
+        Mode 1006 (SGR) -> ``ESC[<{code};{col};{row}M|m``. Otherwise the legacy
+        X10 / button-event format ``ESC[M`` followed by three bytes (button,
+        col, row -- each +32, coords 1-based and clamped to the 1..223 byte
+        range). A legacy button release is reported with button code 3.
+        """
+        c = max(1, min(col + 1, 223))
+        r = max(1, min(row + 1, 223))
+        if _SGR_MOUSE in self._priv_modes:
+            return f"\x1b[<{code};{c};{r}{'M' if pressed else 'm'}"
+        btn = 3 if (not pressed and code <= 2) else code
+        return "\x1b[M" + chr(32 + btn) + chr(32 + c) + chr(32 + r)
 
     def _send_mouse(self, event, pressed: bool) -> None:
-        # SGR mouse encoding: ESC[<{button};{col};{row}M|m
         btn_map = {
             Qt.MouseButton.LeftButton: 0,
             Qt.MouseButton.MiddleButton: 1,
@@ -354,8 +665,7 @@ class TerminalWidget(QWidget):
         if mods & Qt.KeyboardModifier.ControlModifier:
             code += 16
         row, col = self._cell_at(event.position())
-        final = "M" if pressed else "m"
-        self._pty.write(f"\x1b[<{code};{col + 1};{row + 1}{final}")
+        self._pty.write(self._mouse_seq(code, col, row, pressed))
 
     # --- selection / clipboard ----------------------------------------------
     def has_selection(self) -> bool:
@@ -380,28 +690,47 @@ class TerminalWidget(QWidget):
             yield r, start, end
 
     def _selection_text(self) -> str:
+        # Selection coordinates are viewport rows (0-based over the visible
+        # grid). Resolve each to its combined history+buffer line using the same
+        # offset->top math as _build_view, computed fresh here (the cached
+        # _view_top may be stale if the offset just changed this tick).
         with self._lock:
-            lines = self._screen.lines
+            hist = self._screen.history.top
+            hist_len = len(hist)
+            buf_lines = self._screen.lines
             columns = self._screen.columns
             buffer = self._screen.buffer
+            total = hist_len + buf_lines
+            view_h = max(1, min(self._rows_for_height(), buf_lines))
+            offset = self._effective_offset(hist_len)
+            top = max(0, total - offset - view_h)
             parts = []
             for r, c1, c2 in self._selection_ranges():
-                if r >= lines:
-                    break
+                idx = top + r
+                if idx < 0 or idx >= total:
+                    continue
+                line = hist[idx] if idx < hist_len else buffer[idx - hist_len]
                 c2 = min(c2, columns - 1)
-                row_text = "".join(buffer[r][c].data for c in range(c1, c2 + 1))
+                row_text = "".join(line[c].data for c in range(c1, c2 + 1))
                 parts.append(row_text.rstrip())
         return "\n".join(parts)
 
     def _clear_selection(self) -> None:
         self._sel_active = False
         self._sel_start = self._sel_end = None
+        # Any path that drops the selection also ends a drag in progress
+        # (e.g. right-click QuickEdit copy mid-drag): otherwise the release
+        # handler would find _sel_active already False, skip its cleanup and
+        # leave the auto-scroll timer running with no button held.
+        self._sel_dragging = False
+        self._stop_autoscroll()
         self.update()
 
     def _copy_text(self, text: str) -> None:
         QGuiApplication.clipboard().setText(text)
 
     def paste(self) -> None:
+        self._scroll_to_bottom()
         text = QGuiApplication.clipboard().text()
         if not text:
             return
@@ -453,7 +782,41 @@ class TerminalWidget(QWidget):
         if (new_cols, new_rows) != (self._cols, self._rows):
             self._cols, self._rows = new_cols, new_rows
             with self._lock:
-                self._screen.resize(lines=new_rows, columns=new_cols)
+                screen = self._screen
+                if new_rows < screen.lines:
+                    # pyte's resize() drops excess top rows on a shrink WITHOUT
+                    # promoting them to history, so push them first -- mirroring
+                    # HistoryScreen.index, which saves a scrolled-off line. This
+                    # keeps the currently-visible top lines recoverable via the
+                    # scrollback.
+                    #
+                    # pyte grows by only bumping ``lines``: the buffer (a
+                    # defaultdict) stays SPARSE, so rows past the old height do
+                    # not exist until first read. Without densifying first, the
+                    # promotion below would read -- and thus materialise -- each
+                    # absent row, aliasing the very same dict into history; pyte's
+                    # coming delete_lines then skips absent *source* rows (its
+                    # ``if (y + count) in self.buffer`` guard) and fails to detach
+                    # the promoted ones, so a later write mutates the scrollback
+                    # and the same line shows up duplicated/ghosted on scroll-back
+                    # (notably after a grow->shrink such as tiling reflow). Touch
+                    # every row first so the shift detaches all promoted rows.
+                    buf = screen.buffer
+                    for y in range(screen.lines):
+                        _ = buf[y]  # force defaultdict to materialise blank rows
+                    for y in range(screen.lines - new_rows):
+                        screen.history.top.append(screen.buffer[y])
+                screen.resize(lines=new_rows, columns=new_cols)
+                # pyte clamps the cursor against the PRE-resize line/column count
+                # (self.lines is updated only after restore_cursor), so a shrink
+                # can leave the cursor out of bounds and the child's next write
+                # landing on a non-existent row. Clamp to the new grid and drop
+                # any buffer rows left beyond the new height (ghosts that would
+                # otherwise resurrect on a later grow).
+                screen.cursor.x = min(screen.cursor.x, screen.columns - 1)
+                screen.cursor.y = min(screen.cursor.y, screen.lines - 1)
+                for y in [k for k in list(screen.buffer) if k >= screen.lines]:
+                    screen.buffer.pop(y, None)
             self._pty.resize(new_cols, new_rows)
         super().resizeEvent(event)
 
