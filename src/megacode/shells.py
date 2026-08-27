@@ -16,6 +16,7 @@ RUN_KINDS: List[Tuple[str, str]] = [
     ("Claude Code", "claude"),
     ("PowerShell", "powershell"),
     ("Command Prompt", "cmd"),
+    ("AI Chat", "chat"),
     ("Custom…", "custom"),
 ]
 
@@ -42,12 +43,20 @@ def find_cmd() -> str:
 
 
 def label_for(kind: str) -> str:
-    return {"claude": "claude", "powershell": "powershell", "cmd": "cmd"}.get(kind, "term")
+    return {
+        "claude": "claude",
+        "powershell": "powershell",
+        "cmd": "cmd",
+        "chat": "chat",
+    }.get(kind, "term")
 
 
 def resolve(kind: str, custom: Optional[str] = None) -> Optional[str]:
     """Return the command line for ``kind``, or ``None`` if it can't be found."""
     if kind == "claude":
+        return find_claude()
+    if kind == "chat":
+        # the chat tile talks to the claude CLI over stdio (no ConPTY)
         return find_claude()
     if kind == "powershell":
         return find_powershell()

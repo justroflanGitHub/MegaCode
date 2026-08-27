@@ -119,6 +119,103 @@ QPushButton#tileClose {{
     background: transparent; border: none; color: #9a9a9a; font-size: 16px; padding: 0 6px;
 }}
 QPushButton#tileClose:hover {{ color: #e74856; }}
+/* pane resizing: the gaps between tiles are draggable splitter handles */
+QSplitter::handle {{ background: transparent; border-radius: 3px; }}
+QSplitter::handle:hover, QSplitter::handle:pressed {{ background: {BORDER_HI}; }}
+
+/* AI chat tiles (web-chatbot look; see chat_widget.py) */
+QWidget#chatRoot {{
+    background: #12151a;
+    border-bottom-left-radius: 6px; border-bottom-right-radius: 6px;
+}}
+QScrollArea#chatScroll {{ background: transparent; border: none; }}
+QWidget#chatMessages {{ background: transparent; }}
+QLabel#chatErrorBubble {{
+    background: #2e1c1e; border: 1px solid #5a2f34; border-radius: 12px;
+    border-bottom-left-radius: 4px; padding: 8px 12px;
+    color: #f0989e; font-size: 12px;
+}}
+QTextBrowser#chatUserBubble {{
+    background: #3a2a22; border: 1px solid #613d2f; border-radius: 12px;
+    border-bottom-right-radius: 4px; padding: 8px 12px;
+    color: #f3e3dc; font-size: 13px;
+    selection-background-color: #2a2f3a;
+}}
+QTextBrowser#chatAssistantBubble {{
+    background: #1b2027; border: 1px solid #262c36; border-radius: 12px;
+    border-bottom-left-radius: 4px; padding: 8px 12px;
+    color: {TEXT}; font-size: 13px;
+    selection-background-color: #2a2f3a;
+}}
+QLabel#chatThinking {{
+    background: transparent; color: {MUTED}; font-size: 12px;
+    font-style: italic;
+}}
+QToolButton#chatCopyBtn {{
+    background: {CARD}; border: 1px solid {BORDER}; border-radius: 6px;
+    color: {MUTED}; font-size: 11px; padding: 2px 8px;
+}}
+QToolButton#chatCopyBtn:hover {{
+    color: {TEXT}; border: 1px solid {BORDER_HI}; background: #1b2029;
+}}
+QLabel#chatEmptyGlyph {{ color: {ACCENT}; font-size: 26px; }}
+QLabel#chatEmptyTitle {{ color: {TEXT}; font-size: 15px; font-weight: 600; }}
+QLabel#chatEmptyHint {{ color: {MUTED}; font-size: 12px; }}
+QToolButton#chatJumpBtn {{
+    background: {CARD}; border: 1px solid {BORDER_HI}; border-radius: 13px;
+    color: {TEXT}; font-size: 11px; padding: 4px 12px;
+}}
+QToolButton#chatJumpBtn:hover {{
+    border: 1px solid {ACCENT}; color: {ACCENT_HI}; background: #1b2029;
+}}
+QFrame#chatInputBar {{ background: #12151a; border-top: 1px solid #1c212a; }}
+QFrame#chatModelBar {{ background: #12151a; border-top: 1px solid #1c212a; }}
+QComboBox#chatModelCombo, QComboBox#chatEffortCombo {{
+    background: {CARD}; border: 1px solid {BORDER}; border-radius: 6px;
+    padding: 2px 8px; color: {TEXT}; font-size: 11px;
+}}
+QComboBox#chatModelCombo:hover, QComboBox#chatEffortCombo:hover {{
+    border: 1px solid {BORDER_HI};
+}}
+QComboBox#chatModelCombo::drop-down, QComboBox#chatEffortCombo::drop-down {{
+    border: none; width: 16px;
+}}
+QPlainTextEdit#chatInput {{
+    background: {CARD}; border: 1px solid {BORDER}; border-radius: 12px;
+    padding: 8px 12px; color: {TEXT}; font-size: 13px;
+    selection-background-color: #2a2f3a;
+}}
+QPlainTextEdit#chatInput:focus {{ border: 1px solid {BORDER_HI}; }}
+QToolButton#chatSendBtn {{
+    background: {ACCENT}; border: none; border-radius: 16px;
+    color: #1a120e; font-size: 15px; font-weight: 700;
+    min-width: 32px; max-width: 32px; min-height: 32px; max-height: 32px;
+}}
+QToolButton#chatSendBtn:hover {{ background: {ACCENT_HI}; }}
+QToolButton#chatSendBtn:pressed {{ background: #c4684a; }}
+QToolButton#chatSendBtn:disabled {{ background: #3a3a3a; color: #777777; border: none; }}
+QToolButton#chatSendBtn[streaming="true"] {{
+    background: {CARD}; border: 1px solid {BORDER_HI}; color: {TEXT};
+}}
+QToolButton#chatSendBtn[streaming="true"]:hover {{
+    border: 1px solid {ACCENT}; color: {ACCENT_HI}; background: #1b2029;
+}}
+QScrollArea#chatScroll QScrollBar:vertical,
+QPlainTextEdit#chatInput QScrollBar:vertical {{
+    background: transparent; width: 8px; margin: 2px;
+}}
+QScrollArea#chatScroll QScrollBar::handle:vertical,
+QPlainTextEdit#chatInput QScrollBar::handle:vertical {{
+    background: {BORDER}; border-radius: 3px; min-height: 24px;
+}}
+QScrollArea#chatScroll QScrollBar::handle:vertical:hover {{ background: {BORDER_HI}; }}
+QScrollArea#chatScroll QScrollBar::handle:vertical:pressed {{ background: {ACCENT}; }}
+QScrollArea#chatScroll QScrollBar::add-line:vertical,
+QScrollArea#chatScroll QScrollBar::sub-line:vertical,
+QPlainTextEdit#chatInput QScrollBar::add-line:vertical,
+QPlainTextEdit#chatInput QScrollBar::sub-line:vertical {{ height: 0; }}
+QScrollArea#chatScroll QScrollBar::add-page:vertical,
+QScrollArea#chatScroll QScrollBar::sub-page:vertical {{ background: transparent; }}
 """
 
 
@@ -151,8 +248,8 @@ class LayoutPreview(QWidget):
 class LauncherPage(QWidget):
     """Choose instance count, folder and launch mode."""
 
-    launch_workspace = Signal(int, str, int, str, str)  # (n, cwd, font_size, command, label)
-    launch_separate = Signal(int, str, int)             # (n, cwd, gap)
+    launch_workspace = Signal(int, str, int, str, str, str)  # (n, cwd, font, command, label, kind)
+    launch_separate = Signal(int, str, int)                  # (n, cwd, gap)
 
     def __init__(self) -> None:
         super().__init__(objectName="root")
@@ -321,7 +418,9 @@ class LauncherPage(QWidget):
         label = shells.label_for(kind)
         if kind == "custom" and custom:
             label = os.path.basename(custom.split()[0]) or "custom"
-        self.launch_workspace.emit(self._count, cwd, self._font_spin.value(), command, label)
+        self.launch_workspace.emit(
+            self._count, cwd, self._font_spin.value(), command, label, kind
+        )
 
     def _emit_separate(self) -> None:
         cwd = self._validated_cwd()
@@ -414,13 +513,13 @@ class MainWindow(QMainWindow):
 
     # --- actions ------------------------------------------------------------
     def _on_launch_workspace(
-        self, n: int, cwd: str, font_size: int, command: str, label: str
+        self, n: int, cwd: str, font_size: int, command: str, label: str, kind: str
     ) -> None:
         if not command:
             QMessageBox.critical(self, "MegaCode", "No command to run.")
             return
         try:
-            self._workspace.start(n, command, cwd, font_size=font_size, label=label)
+            self._workspace.start(n, command, cwd, font_size=font_size, label=label, kind=kind)
         except Exception as exc:  # noqa: BLE001
             log.exception("workspace start failed")
             QMessageBox.critical(self, "MegaCode", f"Failed to start terminals:\n{exc}")
