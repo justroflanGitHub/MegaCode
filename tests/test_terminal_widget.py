@@ -24,6 +24,8 @@ from megacode import terminal_widget as tw  # noqa: E402
 class _FakePty:
     """A stand-in for ``Pty`` that never spawns a child."""
 
+    alive = True  # flip to False to simulate the child exiting
+
     def __init__(self, *_a, **_k) -> None:
         pass
 
@@ -37,7 +39,7 @@ class _FakePty:
         return None
 
     def is_alive(self) -> bool:
-        return True
+        return self.alive
 
     def stop(self) -> None:
         return None
@@ -245,6 +247,236 @@ def test_typing_returns_to_bottom(term):
     # _scroll_to_bottom is what keyPressEvent/paste use to follow input
     term._scroll_to_bottom()
     assert term._scroll_offset == 0
+
+
+def test_run_command_writes_cr_and_follows_bottom(term):
+    """Broadcast target: the line + Enter reaches the PTY, and a view that was
+    scrolled back jumps to the live prompt so the output is visible."""
+    for i in range(40):
+        term._on_output(f"line{i:02d}\r\n")
+    term._scroll_offset = 5
+    term._build_view()  # sync the freeze baseline before the jump
+    written: List[str] = []
+    term._pty.write = written.append  # type: ignore[method-assign]
+
+    term.run_command("echo hi")
+
+    assert written == ["echo hi\r"]
+    assert term._scroll_offset == 0
+
+
+# --- pending input (the "run pasted" button) + sync-input mirroring ------------
+
+
+def _spy(term) -> List[tuple]:
+    sent: List[tuple] = []
+    term.inputSent.connect(lambda seq, pasted: sent.append((seq, pasted)))
+    return sent
+
+
+def _paste(term, text: str) -> None:
+    QGuiApplication.clipboard().setText(text)
+    term.paste()
+
+
+def test_paste_arms_pending_and_announces_paste(term, qapp):
+    """A paste into a bracketed-paste shell (PSReadLine, claude) lands in the
+    input line unexecuted: the pane arms, and the raw clipboard text -- not the
+    wrapped sequence -- is announced, so receivers apply their own paste mode."""
+    term._priv_modes.add(2004)
+    sent = _spy(term)
+    changes: List[int] = []
+    term.pendingChanged.connect(lambda: changes.append(1))
+    written: List[str] = []
+    term._pty.write = written.append  # type: ignore[method-assign]
+
+    _paste(term, "echo hi")
+
+    assert written == ["\x1b[200~echo hi\x1b[201~"]
+    assert term.has_pending_input()
+    assert changes == [1]
+    assert sent == [("echo hi", True)]
+
+
+def test_paste_strips_one_trailing_newline_so_the_command_waits(term, qapp):
+    """ConPTY's cmd/PowerShell never negotiate bracketed paste (verified
+    against real streams: only ?1004h/?9001h), so a paste carrying its
+    trailing newline would run immediately and the paste-first workflow would
+    be dead in the default panes. One trailing CR is stripped: the command
+    waits at the prompt and the pane arms, like in a bracketed-paste shell."""
+    written: List[str] = []
+    term._pty.write = written.append  # type: ignore[method-assign]
+
+    _paste(term, "echo hi\n")            # the usual "copy button" clipboard
+    assert written == ["echo hi"]
+    assert term.has_pending_input()
+
+    # a multi-line block: earlier lines run, the last one waits at the prompt
+    _paste(term, "echo a\necho b\n")
+    assert written[-1] == "echo a\recho b"
+    assert term.has_pending_input()
+
+    # a genuinely blank tail executes for real: nothing ends up waiting
+    _paste(term, "echo c\n\n")
+    assert written[-1] == "echo c\r"
+    assert not term.has_pending_input()
+
+
+def test_paste_into_alt_screen_tui_arms_nothing(term, qapp):
+    """nano/vim live on the alternate screen: pasted text went into the app's
+    buffer, not a command line, so the run-pasted button must not arm."""
+    term._priv_modes.update({1049, 2004})
+    _paste(term, "text into a buffer, not a prompt")
+    assert not term.has_pending_input()
+
+
+def test_enter_escape_and_ctrl_c_disarm_pending_but_typing_keeps_it(term, qapp):
+    """Every way a waiting line retires -- Enter runs it, Esc clears it,
+    Ctrl+C abandons it (PSReadLine/cmd line-cancel) -- must disarm the pane;
+    plain typing only appends, so the paste is still waiting behind it."""
+    changes: List[int] = []
+    term.pendingChanged.connect(lambda: changes.append(1))
+
+    term._pending_input = True
+    _press(term, Qt.Key.Key_Return)
+    assert not term.has_pending_input()
+
+    term._pending_input = True
+    _press(term, Qt.Key.Key_Escape)
+    assert not term.has_pending_input()
+
+    term._pending_input = True
+    _press(term, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier)
+    assert not term.has_pending_input()
+
+    term._pending_input = True
+    _press(term, Qt.Key.Key_A, text="a")
+    assert term.has_pending_input()
+
+    # every transition above announced itself to the toolbar button
+    assert changes == [1, 1, 1]
+
+
+def test_execute_pending_presses_enter_exactly_once(term):
+    written: List[str] = []
+    term._pty.write = written.append  # type: ignore[method-assign]
+
+    term.execute_pending()          # nothing waiting -> no stray Enter
+    assert written == []
+
+    term._pending_input = True
+    term.execute_pending()
+    assert written == ["\r"]
+    assert not term.has_pending_input()
+
+    term.execute_pending()          # already disarmed: still exactly one
+    assert written == ["\r"]
+
+
+def test_keys_announce_input_for_mirroring(term):
+    sent = _spy(term)
+    _press(term, Qt.Key.Key_A, text="a")
+    _press(term, Qt.Key.Key_Up)
+    assert sent == [("a", False), ("\x1b[A", False)]
+
+
+def test_inject_input_writes_without_reannouncing(term):
+    """Mirrored input must not be re-announced, or the workspace fan-out
+    would loop forever."""
+    sent = _spy(term)
+    term._priv_modes.add(2004)
+    written: List[str] = []
+    term._pty.write = written.append  # type: ignore[method-assign]
+
+    term.inject_input("\x1b[A")
+    term.inject_input("npm test", pasted=True)
+
+    assert written == ["\x1b[A", "\x1b[200~npm test\x1b[201~"]
+    assert sent == []
+
+
+def test_mirrored_enter_runs_this_panes_waiting_paste(term):
+    term._priv_modes.add(2004)
+    _paste(term, "echo hi")
+    assert term.has_pending_input()
+
+    term.inject_input("\r")
+
+    assert not term.has_pending_input()
+
+
+def test_run_command_disarms_pending_and_is_not_mirrored(term):
+    """run_command is workspace-initiated: its CR executes whatever waited, and
+    sync mode must not echo it (every pane already got the command)."""
+    term._pending_input = True
+    sent = _spy(term)
+
+    term.run_command("echo hi")
+
+    assert not term.has_pending_input()
+    assert sent == []
+
+
+def test_child_death_disarms_pending(term):
+    """A dead pane can never run its waiting input; tick() must disarm it so
+    the toolbar button does not keep pointing at a corpse."""
+    changes: List[int] = []
+    term.pendingChanged.connect(lambda: changes.append(1))
+    term._pending_input = True
+    term._pty.alive = False
+
+    term.tick()
+
+    assert term.is_dead()
+    assert not term.has_pending_input()
+    assert changes == [1]
+
+
+def test_dead_pane_announces_nothing(term):
+    """An exited pane keeps keyboard focus until the user clicks away; its
+    keys (and right-click QuickEdit pastes!) must not leak into sync mode."""
+    sent = _spy(term)
+    term._dead = True
+
+    _press(term, Qt.Key.Key_A, text="a")
+    _paste(term, "rm -rf /tmp/x\necho done")
+    term.inject_input("x")
+
+    assert sent == []
+
+
+def test_mirrored_input_follows_the_live_bottom(term):
+    """A receiving pane left scrolled back must jump to the prompt, like the
+    local input paths -- otherwise sync mode types into a view the user
+    cannot see (offset frozen on old lines)."""
+    for i in range(40):
+        term._on_output(f"line{i:02d}\r\n")
+    term._build_view()                       # sync the freeze baseline
+    term._scroll_offset = 6
+
+    term.inject_input("x")
+
+    assert term._scroll_offset == 0
+
+
+def test_mouse_input_is_never_announced_for_mirroring(term):
+    """Sync mode fans keyboard only: mouse packets are built from THIS pane's
+    grid coordinates and would corrupt a differently-sized pane's TUI."""
+    sent = _spy(term)
+    term._priv_modes.update({1000, 1006})    # the app tracks the mouse
+
+    def _mouse(kind, pos, button, buttons):
+        return QMouseEvent(kind, pos, QPointF(100, 100), button, buttons,
+                           Qt.KeyboardModifier.NoModifier)
+
+    term.mousePressEvent(_mouse(QEvent.Type.MouseButtonPress, QPointF(100, 200),
+                                Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton))
+    term.mouseMoveEvent(_mouse(QEvent.Type.MouseMove, QPointF(120, 200),
+                               Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton))
+    term.mouseReleaseEvent(_mouse(QEvent.Type.MouseButtonRelease, QPointF(120, 200),
+                                  Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton))
+
+    assert sent == []
 
 
 def _press(term, key, mods=Qt.KeyboardModifier.NoModifier, text: str = "") -> None:

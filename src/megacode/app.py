@@ -99,6 +99,15 @@ QToolButton#toolbarBtn {{
     padding: 6px 12px; color: {TEXT};
 }}
 QToolButton#toolbarBtn:hover {{ border: 1px solid {BORDER_HI}; }}
+QToolButton#toolbarBtn:disabled {{ color: {MUTED}; border: 1px solid {BORDER}; }}
+/* the sync-input toggle reads as "armed" while mirroring is live */
+QToolButton#toolbarBtn:checked {{
+    background: #3a2a22; border: 1px solid {ACCENT}; color: #f3e3dc;
+}}
+/* the run-pasted button lights up while some pane holds pasted input */
+QToolButton#toolbarBtn[armed="true"] {{
+    border: 1px solid {ACCENT}; color: {ACCENT_HI};
+}}
 QToolButton#toolbarBtn::menu-button {{ border: none; width: 16px; }}
 QPushButton#launch {{
     background: {ACCENT}; border: none; border-radius: 10px;
@@ -110,6 +119,13 @@ QPushButton#launch:disabled {{ background: #3a3a3a; color: #777777; }}
 /* workspace */
 QFrame#toolbar {{ background: {CARD}; border: 1px solid {BORDER}; border-radius: 10px; }}
 QLabel#toolbarTitle {{ color: {TEXT}; font-size: 13px; font-weight: 600; }}
+/* the broadcast bar's command box: slimmer than the launcher fields so it
+   matches the toolbar buttons' height, darker to read as an input */
+QLineEdit#broadcastInput {{
+    background: {BG}; border: 1px solid {BORDER}; border-radius: 8px;
+    padding: 5px 10px; color: {TEXT};
+}}
+QLineEdit#broadcastInput:focus {{ border: 1px solid {ACCENT}; }}
 QFrame#tile {{ background: #1e1e1e; border: 1px solid #2a2a2a; border-radius: 6px; }}
 QFrame#tile[drop="true"] {{ border: 2px solid {ACCENT}; }}
 QFrame#tileHeader {{ background: #252526; border-top-left-radius: 6px; border-top-right-radius: 6px; }}
@@ -495,9 +511,17 @@ class MainWindow(QMainWindow):
 
     def _enter_workspace(self) -> None:
         # Undo the launcher's fixed size so the window can be resized /
-        # maximized / fullscreened.
-        self.setMinimumSize(360, 260)
+        # maximized / fullscreened. The width floor follows the workspace's
+        # real minimum (the full toolbar row -- broadcast box, Run all, Run
+        # pasted, Sync input, Add, Minimize, Fullscreen -- measures ~1300px,
+        # and narrower would crush the buttons into slivers): the launcher's
+        # 360 would let the window squeeze them into slivers. Maximum is
+        # raised first -- the launcher's setFixedSize left it at 520x660, and
+        # a minimum above that would clamp to it.
         self.setMaximumSize(16777215, 16777215)
+        self.setMinimumSize(
+            max(360, self._workspace.minimumSizeHint().width()), 260
+        )
         self._stack.setCurrentWidget(self._workspace)
         if not (self.isMaximized() or self.isFullScreen()):
             self.showMaximized()

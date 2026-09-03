@@ -82,6 +82,31 @@ Each embedded terminal behaves like the classic Windows console:
   swapping terminals.
 - **Rename a tile** — double-click a tile's title bar to rename it. The name
   travels with the session across drag-swaps; clear it to revert to `cmd #N`.
+- **Run a command in every pane** — type it in the toolbar's command box and
+  press **▶ Run all** (or just `Enter` in the box): the command is executed in
+  each open terminal at once. Chat tiles, exited panes and panes holding
+  pasted input (those belong to **↵ Run pasted**, see below — appending would
+  concatenate the two lines) are skipped, and the toolbar title briefly shows
+  how many panes received the command.
+- **Run every pasted command at once** — paste a different command into each
+  pane, then press **↵ Run pasted**: every pane whose input is still waiting
+  gets its `Enter` in the same instant. One trailing newline is stripped from
+  each paste, so the pasted command waits at the prompt even in `cmd` /
+  PowerShell (which, unlike Claude Code and PSReadLine-style apps, don't
+  negotiate bracketed paste through ConPTY) instead of executing on paste.
+  The button shows how many panes are waiting and lights up while armed;
+  panes you didn't paste into are never touched (no stray `Enter` inside
+  `nano` etc. — a paste into a full-screen TUI never arms). Running the line
+  by hand, `Esc`, `Ctrl+C` or closing/exiting the pane disarms it. Note: a
+  Claude Code pane counts as waiting too, so clicking the button submits its
+  input box; a multi-line pasted block in plain `cmd`/PowerShell still runs
+  its earlier lines at paste time (only the last one waits).
+- **Sync input across panes** — toggle **⇉ Sync input** and everything you type
+  in the focused pane is mirrored into all the others at once: commands,
+  arrow-key history and cursor moves, `nano`/`vim` editing, Claude Code — all
+  consoles stay in lockstep, tmux `synchronize-panes` style. Click again to
+  stop. (Keyboard only — mouse clicks stay per-pane, since each pane has its
+  own geometry.)
 
 ## AI Chat tiles
 

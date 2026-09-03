@@ -439,11 +439,16 @@ class _FakeTerminal(QWidget):
     """Stands in for ``TerminalWidget``: same API, no child process."""
 
     finished = Signal()
+    inputSent = Signal(str, bool)
+    pendingChanged = Signal()
 
     def __init__(self, _command, _cwd=None, font_size=10, parent=None):  # noqa: ARG002
         super().__init__(parent)
 
     def is_dead(self):
+        return False
+
+    def has_pending_input(self):
         return False
 
     def tick(self):

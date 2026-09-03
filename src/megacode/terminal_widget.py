@@ -35,6 +35,14 @@ _PRIV_MODE = re.compile(r"\x1b\[\?([0-9;]+)([hl])")
 _BRACKETED_PASTE = 2004
 _MOUSE_TRACKING = {1000, 1002, 1003}  # X10 / button-event / any-event
 _SGR_MOUSE = 1006
+# DECSET 47 / 1047 / 1049: the alternate screen used by full-screen TUIs
+# (nano, vim, less). Text pasted there lands in an app buffer, not a prompt.
+_ALT_SCREEN_MODES = {47, 1047, 1049}
+# Key sequences that end a pane's "input waiting at the prompt" state: Enter
+# executes the line; Esc clears it (PSReadLine revert, claude's clear);
+# Ctrl+C / Ctrl+Break abandon it. Shared by typed and mirrored input so a
+# pane never stays armed after its line is gone.
+_CANCEL_SEQS = ("\r", "\x1b", "\x03", "\x1c")
 
 #: How many scrolled-off lines to retain so they can be scrolled back to with
 #: the mouse wheel (this is what cmd/powershell "lose the top output" needs).
@@ -127,6 +135,14 @@ class TerminalWidget(QWidget):
 
     #: Emitted when the child process exits.
     finished = Signal()
+    #: User-originated input was written to this pane: ``(data, is_paste)``.
+    #: Keys carry the encoded VT sequence; a paste carries the RAW clipboard
+    #: text so every receiving pane can apply its own bracketed-paste mode.
+    #: The workspace mirrors this to the other panes in sync-input mode.
+    inputSent = Signal(str, bool)
+    #: The "pasted input waiting for Enter" state changed (arms/disarms the
+    #: workspace's "run pasted" button).
+    pendingChanged = Signal()
 
     def __init__(
         self,
@@ -209,6 +225,11 @@ class TerminalWidget(QWidget):
         palette.setColor(QPalette.ColorRole.WindowText, self._default_fg)
         self.setPalette(palette)
 
+        # "pasted input waiting for Enter" -- armed by paste(), disarmed when
+        # the line actually runs (manual Enter, run_command, or the workspace's
+        # "run pasted" button). Drives that button's enabled state.
+        self._pending_input = False
+
         self._dead = False
 
     # --- PTY output -> pyte -> repaint --------------------------------------
@@ -245,6 +266,10 @@ class TerminalWidget(QWidget):
     @property
     def _bracketed_paste(self) -> bool:
         return _BRACKETED_PASTE in self._priv_modes
+
+    @property
+    def _alt_screen(self) -> bool:
+        return bool(self._priv_modes & _ALT_SCREEN_MODES)
 
     @property
     def _mouse_on(self) -> bool:
@@ -416,7 +441,10 @@ class TerminalWidget(QWidget):
         self._scroll_to_bottom()
         seq = self._encode_key(event)
         if seq:
-            self._pty.write(seq)
+            if seq in _CANCEL_SEQS:
+                # Enter/Esc/Ctrl+C all retire the waiting line one way or another
+                self._set_pending(False)
+            self._write_input(seq)
         else:
             super().keyPressEvent(event)
 
@@ -730,15 +758,109 @@ class TerminalWidget(QWidget):
         QGuiApplication.clipboard().setText(text)
 
     def paste(self) -> None:
+        if self._dead:
+            return
         self._scroll_to_bottom()
         text = QGuiApplication.clipboard().text()
         if not text:
             return
+        self._deliver_paste(text)
+        self.inputSent.emit(text, True)
+
+    def _deliver_paste(self, text: str) -> None:
+        """Write clipboard ``text`` into this pane and track the pending state.
+
+        Shared by the local paste and by mirrored input (sync-input mode): the
+        raw clipboard text travels so each pane applies its own bracketed-paste
+        mode. A paste arms this pane for the workspace's "run pasted" button --
+        unless it executed itself (blank tail) or landed inside a full-screen
+        TUI, where it went into an app buffer (nano's file), not a prompt.
+        """
         # terminals use CR, not LF
         text = text.replace("\r\n", "\r").replace("\n", "\r")
+        # One trailing newline is stripped: ConPTY's cmd/PowerShell never
+        # negotiate bracketed paste (verified: both emit only ?1004h/?9001h),
+        # so a paste carrying its newline would run immediately and the
+        # "paste, then ↵ Run pasted" workflow would be dead in the default
+        # panes. Without it the command waits, like in any bracketed-paste
+        # shell. (A blank tail -- "cmd\n\n" -- still executes for real.)
+        if text.endswith("\r"):
+            text = text[:-1]
+        if not text:
+            return
         if self._bracketed_paste:
             text = f"\x1b[200~{text}\x1b[201~"
+            pending = True
+        else:
+            pending = not text.endswith("\r")
+        if self._alt_screen:
+            pending = False
         self._pty.write(text)
+        self._set_pending(pending)
+
+    # --- pending input + mirrored (sync) input -------------------------------
+    def _set_pending(self, value: bool) -> None:
+        if value == self._pending_input:
+            return
+        self._pending_input = value
+        self.pendingChanged.emit()
+
+    def has_pending_input(self) -> bool:
+        """True while pasted-but-unexecuted input sits at this pane's prompt."""
+        return self._pending_input
+
+    def execute_pending(self) -> None:
+        """Press Enter on the waiting input (the "run pasted" button)."""
+        if not self._pending_input:
+            return
+        self._set_pending(False)
+        self._scroll_to_bottom()
+        self._pty.write("\r")
+
+    def _write_input(self, seq: str) -> None:
+        """Write user-typed input and announce it for sync-input mirroring."""
+        if self._dead:
+            # an exited pane keeps keyboard focus until clicked away; emitting
+            # here would leak its keys (and pastes!) into every live pane
+            return
+        self._pty.write(seq)
+        self.inputSent.emit(seq, False)
+
+    def inject_input(self, seq: str, pasted: bool = False) -> None:
+        """Receive a pane's user input mirrored by the workspace (sync mode).
+
+        Writes straight to the PTY -- deliberately NOT through ``inputSent`` --
+        so mirrored input can never trigger a second fan-out. Paste payloads
+        re-deliver here (this pane's own bracketed-paste mode and pending
+        flag); a mirrored Enter/Esc/Ctrl+C runs/clears this pane's waiting
+        line too. The view follows the live bottom, like every local input
+        path: a pane left scrolled back must still show what it receives.
+        """
+        if self._dead:
+            return
+        self._scroll_to_bottom()
+        if pasted:
+            self._deliver_paste(seq)
+            return
+        if seq in _CANCEL_SEQS:
+            self._set_pending(False)
+        self._pty.write(seq)
+
+    def run_command(self, command: str) -> None:
+        """Type ``command`` at the prompt and press Enter.
+
+        The broadcast target for the workspace's "run in every pane" bar. A
+        plain write + CR -- deliberately NOT bracketed-paste wrapped, so the
+        shell sees the line as typed input and executes it. The view follows
+        the live bottom first so the command's output is what the user sees.
+        The workspace skips panes holding pasted input (appending would
+        concatenate "<pasted><command>" onto one line); the disarm here is
+        just defense in depth. Workspace-initiated, so this is NOT announced
+        on ``inputSent`` (sync mode must not echo it a second time).
+        """
+        self._scroll_to_bottom()
+        self._set_pending(False)
+        self._pty.write(command + "\r")
 
     def _encode_key(self, event) -> Optional[str]:
         key = event.key()
@@ -834,6 +956,8 @@ class TerminalWidget(QWidget):
         """Called on a timer to detect child exit and refresh the cursor."""
         if not self._dead and not self._pty.is_alive():
             self._dead = True
+            # a dead pane can never run its waiting input; disarm the button
+            self._set_pending(False)
             self.finished.emit()
         self.update()
 
