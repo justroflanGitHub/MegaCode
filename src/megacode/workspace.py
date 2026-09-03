@@ -12,13 +12,15 @@ from __future__ import annotations
 import logging
 from typing import List, Optional
 
-from PySide6.QtCore import QMimeData, QPoint, Qt, Signal, Slot
+from PySide6.QtCore import QMimeData, QPoint, Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QDrag
 from PySide6.QtWidgets import (
+    QApplication,
     QFrame,
     QHBoxLayout,
     QInputDialog,
     QLabel,
+    QLineEdit,
     QMenu,
     QPushButton,
     QSplitter,
@@ -41,6 +43,8 @@ _TILE_MIME = "application/x-megacode-tile"
 _SPLIT_HANDLE = 8
 #: Floor for a tile's size so splitter drags can't shrink a pane to nothing.
 _TILE_MIN_W, _TILE_MIN_H = 180, 120
+#: How long the "ran in N panes" feedback stays in the toolbar title.
+_STATUS_FLASH_MS = 2000
 
 
 class TileHeader(QFrame):
@@ -234,6 +238,9 @@ class WorkspaceView(QWidget):
         self._font_size = 10
         self._label = "term"
         self.tiles: List[TerminalTile] = []
+        # sync-input mode: every keystroke from the focused pane is mirrored
+        # into all the others (tmux synchronize-panes). Toggled per workspace.
+        self._sync_keys = False
 
         root = QVBoxLayout(self)
         root.setContentsMargins(10, 10, 10, 10)
@@ -250,12 +257,16 @@ class WorkspaceView(QWidget):
         root.addWidget(self._splitter, 1)
 
         # exit detection (no per-tick repaint: cursor is static, output repaints)
-        from PySide6.QtCore import QTimer
-
         self._ticker = QTimer(self)
         self._ticker.setInterval(400)
         self._ticker.timeout.connect(self._tick)
         self._ticker.start()
+
+        # transient "ran in N panes" feedback in the toolbar title
+        self._status_timer = QTimer(self)
+        self._status_timer.setSingleShot(True)
+        self._status_timer.setInterval(_STATUS_FLASH_MS)
+        self._status_timer.timeout.connect(self._restore_status)
 
     # --- toolbar ------------------------------------------------------------
     def _build_toolbar(self) -> QWidget:
@@ -265,8 +276,70 @@ class WorkspaceView(QWidget):
         layout.setSpacing(8)
         self._count_label = QLabel("MegaCode")
         self._count_label.setObjectName("toolbarTitle")
+        # An explicit small floor lets the TITLE absorb a narrow-window squeeze
+        # (clipping text) instead of the buttons: without it the label's text
+        # width (~220px) sets the row's layout minimum and every button gets
+        # crushed to an unreadable sliver below ~900px of window width.
+        self._count_label.setMinimumWidth(48)
         layout.addWidget(self._count_label)
         layout.addStretch(1)
+
+        # Broadcast bar: one command, executed in every open terminal pane.
+        self._broadcast_input = QLineEdit(objectName="broadcastInput")
+        self._broadcast_input.setPlaceholderText("Command for every pane…")
+        self._broadcast_input.setClearButtonEnabled(True)
+        self._broadcast_input.setToolTip(
+            "Run this command in every open terminal pane\n"
+            "(Enter or the Run all button; chat tiles are skipped)"
+        )
+        # Tile drags carry text/plain (the swap mime includes setText), so a
+        # missed drop would otherwise type a tile index into the command box.
+        self._broadcast_input.setAcceptDrops(False)
+        self._broadcast_input.returnPressed.connect(self._broadcast)
+        self._broadcast_input.textChanged.connect(self._update_broadcast_button)
+        # Stretch (capped): the box takes the spare width up to a comfortable
+        # size instead of sitting pinned at its sizeHint -- and then collapsing
+        # to ~2 characters on a snapped/half-screen window.
+        self._broadcast_input.setMaximumWidth(460)
+        layout.addWidget(self._broadcast_input, 1)
+
+        self._broadcast_btn = QToolButton(objectName="toolbarBtn")
+        self._broadcast_btn.setText("▶  Run all")
+        self._broadcast_btn.setToolTip(
+            "Run the command in every open terminal pane\n"
+            "(panes holding pasted input are left to the Run pasted button)"
+        )
+        self._broadcast_btn.clicked.connect(self._broadcast)
+        layout.addWidget(self._broadcast_btn)
+        self._update_broadcast_button()
+
+        # Run pasted: press Enter in every pane where pasted input is still
+        # waiting, so per-pane commands pasted beforehand all run at once.
+        self._exec_btn = QToolButton(objectName="toolbarBtn")
+        self._exec_btn.setText("↵  Run pasted")
+        self._exec_btn.setToolTip(
+            "Press Enter in every pane where pasted input is waiting\n"
+            "(paste different commands into the panes, then run them all at once;\n"
+            "panes without waiting input are not touched; a Claude Code pane\n"
+            "submits its input box; Esc / Ctrl+C / closing disarms a pane)"
+        )
+        self._exec_btn.setEnabled(False)
+        self._exec_btn.clicked.connect(self._execute_pasted)
+        layout.addWidget(self._exec_btn)
+
+        # Sync input: mirror the keyboard from the focused pane into every
+        # other pane (typing, arrows, nano/vim editing...), tmux-style.
+        self._sync_btn = QToolButton(objectName="toolbarBtn")
+        self._sync_btn.setText("⇉  Sync input")
+        self._sync_btn.setCheckable(True)
+        self._sync_btn.setToolTip(
+            "Mirror keyboard input from the focused pane to every other pane\n"
+            "(typing, arrows, nano/vim editing — everything, at once).\n"
+            "Keyboard only: mouse clicks/wheel stay per-pane, since every pane\n"
+            "has its own geometry. Click again to stop mirroring."
+        )
+        self._sync_btn.toggled.connect(self._on_sync_toggled)
+        layout.addWidget(self._sync_btn)
 
         self._add_btn = QToolButton(objectName="toolbarBtn")
         self._add_btn.setText("＋  Add")
@@ -304,6 +377,122 @@ class WorkspaceView(QWidget):
         else:
             window.showFullScreen()
 
+    # --- broadcast (run a command in every pane) -----------------------------
+    @Slot()
+    def _broadcast(self) -> None:
+        """Run the toolbar command in every live terminal pane.
+
+        Chat tiles are not consoles and exited panes have no prompt left, so
+        both are skipped; the title flashes how many panes actually got it.
+        """
+        command = self._broadcast_input.text().strip()
+        if not command:
+            return
+        prev = QApplication.focusWidget()
+        sent = 0
+        for term in self._terminal_panes():
+            if term.is_dead() or term.has_pending_input():
+                # Appending the command onto a pane's waiting pasted line would
+                # run "<pasted><command>" as ONE line (verified: cmd executes
+                # "echo AAAecho BBB"). Those panes are the Run pasted button's
+                # job; the flash below reports the narrower delivery.
+                continue
+            term.run_command(command)
+            sent += 1
+        self._flash_status(f"ran in {sent} pane{'s' if sent != 1 else ''}")
+        # Enter-to-run must not strand the keyboard in the box: a follow-up
+        # keystroke meant for a pane would silently mutate the retained command
+        # and re-run it in EVERY pane. Hand focus back to the pane the user
+        # came from (the click path never left it); nowhere to go back -> the
+        # first tile, matching every other action in this class.
+        if (prev is not None and prev is not self._broadcast_input
+                and isinstance(prev, TerminalWidget) and not prev.is_dead()):
+            prev.setFocus()
+        else:
+            self._focus_first()
+
+    def _update_broadcast_button(self) -> None:
+        # nothing to run: keep the button visibly disabled rather than dead
+        self._broadcast_btn.setEnabled(bool(self._broadcast_input.text().strip()))
+
+    # --- run pasted (Enter in every pane that is holding input) ---------------
+    def _terminal_panes(self) -> List[TerminalWidget]:
+        """Every currently-open console pane (chat tiles are not consoles)."""
+        return [
+            tile.terminal for tile in self.tiles
+            if isinstance(tile.terminal, TerminalWidget)
+        ]
+
+    @Slot()
+    def _execute_pasted(self) -> None:
+        """Press Enter in every pane where pasted input is still waiting.
+
+        Each pane runs its own pasted command; panes without waiting input are
+        untouched -- no stray blank lines at empty prompts, no stray Enter
+        inside a TUI. The title flashes how many panes actually ran.
+        """
+        prev = QApplication.focusWidget()
+        waiting = [
+            t for t in self._terminal_panes()
+            if not t.is_dead() and t.has_pending_input()
+        ]
+        for term in waiting:
+            term.execute_pending()
+        self._flash_status(
+            f"ran in {len(waiting)} pane{'s' if len(waiting) != 1 else ''}"
+        )
+        self._update_exec_button()
+        # Same rule as the broadcast bar: the keyboard stays with the panes.
+        if prev is not None and isinstance(prev, TerminalWidget) and not prev.is_dead():
+            prev.setFocus()
+        else:
+            self._focus_first()
+
+    def _update_exec_button(self) -> None:
+        """Arm "run pasted" only while some live pane is holding input."""
+        waiting = [
+            t for t in self._terminal_panes()
+            if not t.is_dead() and t.has_pending_input()
+        ]
+        self._exec_btn.setEnabled(bool(waiting))
+        # A dimmed button alone reads as "disabled" -- the armed state must be
+        # findable: the waiting count goes into the label and the accent border
+        # lights up (QSS [armed="true"], repolished like the drop highlight).
+        self._exec_btn.setText(
+            "↵  Run pasted" + (f" ({len(waiting)})" if waiting else "")
+        )
+        self._exec_btn.setProperty("armed", "true" if waiting else "false")
+        self._exec_btn.style().unpolish(self._exec_btn)
+        self._exec_btn.style().polish(self._exec_btn)
+
+    # --- sync input (mirror the keyboard to every pane) -----------------------
+    @Slot(bool)
+    def _on_sync_toggled(self, checked: bool) -> None:
+        self._sync_keys = checked
+        self._flash_status("sync input on" if checked else "sync input off")
+
+    def _mirror_input(self, source: TerminalWidget, seq: str, pasted: bool) -> None:
+        """Fan one pane's user input out to the others (sync-input mode).
+
+        Connected per pane in ``_new_tile``. The source never receives its own
+        echo, and ``inject_input`` does not re-emit ``inputSent``, so there is
+        no feedback loop. Only keystrokes/pastes travel: PTY-sized panes render
+        TUIs at their own geometry, so mouse clicks (coordinates!) must not.
+        """
+        if not self._sync_keys:
+            return
+        for term in self._terminal_panes():
+            if term is not source and not term.is_dead():
+                term.inject_input(seq, pasted=pasted)
+
+    def _flash_status(self, text: str) -> None:
+        self._count_label.setText(text)
+        self._status_timer.start()
+
+    def _restore_status(self) -> None:
+        n = len(self.tiles)
+        self._count_label.setText(f"MegaCode · {n} pane{'s' if n != 1 else ''}")
+
     # --- lifecycle ----------------------------------------------------------
     def start(
         self,
@@ -315,6 +504,11 @@ class WorkspaceView(QWidget):
         kind: str = "terminal",
     ) -> None:
         self.cleanup()
+        # A new workspace is a new context: the previous session's command must
+        # not stay armed one accidental click away in the fresh panes, and
+        # stale sync must not type the old session's keys into them.
+        self._broadcast_input.clear()
+        self._sync_btn.setChecked(False)
         self._command = command
         self._cwd = cwd
         self._font_size = font_size
@@ -324,6 +518,7 @@ class WorkspaceView(QWidget):
         tile_kind = "chat" if kind == "chat" else "terminal"
         for _ in range(n):
             self._new_tile(command, label, tile_kind)
+        self._update_exec_button()
         self._focus_first()
 
     def _new_tile(self, command: str, label: str, kind: str = "terminal") -> TerminalTile:
@@ -333,6 +528,15 @@ class WorkspaceView(QWidget):
         )
         tile.swapRequested.connect(self._on_swap)
         tile.closeRequested.connect(self._on_close_tile)
+        if isinstance(tile.terminal, TerminalWidget):
+            term = tile.terminal
+            # Per-pane hooks for the two broadcast features. The lambda closes
+            # over the WIDGET (not the tile), so the fan-out source stays the
+            # same object across drag-swaps. Chat tiles have neither signal.
+            term.inputSent.connect(
+                lambda seq, pasted, src=term: self._mirror_input(src, seq, pasted)
+            )
+            term.pendingChanged.connect(self._update_exec_button)
         self.tiles.append(tile)
         self._rebuild()
         return tile
@@ -419,7 +623,7 @@ class WorkspaceView(QWidget):
                     self._apply_sizes(row_widget, widths)
         else:
             self._restore_sizes(groups, row_widgets, saved)
-        self._count_label.setText(f"MegaCode · {n} pane{'s' if n != 1 else ''}")
+        self._restore_status()
 
     def _apply_sizes(self, splitter: QSplitter, sizes: List[int]) -> None:
         """Set pane sizes; 0 entries (unknown) take the siblings' average."""
@@ -464,6 +668,8 @@ class WorkspaceView(QWidget):
         tile.setParent(None)
         tile.deleteLater()
         self.tiles.pop(index)
+        # the closed pane may have been the only one holding pasted input
+        self._update_exec_button()
         if not self.tiles:
             self.all_closed.emit()
         else:
