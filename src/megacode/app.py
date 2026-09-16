@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
 from . import shells
 from . import terminal as separate_terminal
 from .layouts import SUPPORTED, compute_layout
+from .tags import TAG_COLORS
 from .workspace import WorkspaceView
 
 log = logging.getLogger("megacode")
@@ -51,6 +52,16 @@ ACCENT_HI = "#e08866"
 TEXT = "#e6e6e6"
 MUTED = "#8a93a3"
 CELL = "#3a3f4b"
+
+# Tag-chip QSS, one rule per color class, generated from the same palette
+# tags.py hashes tag names into -- chips, menu icons and QSS can never
+# disagree about a tag's color. (Inserted into QSS below; its braces are
+# literal content, not f-string placeholders.)
+_tag_chip_qss = "".join(
+    f'QLabel#tileTag[tagClass="{i}"] '
+    f'{{ background: {bg}; border: 1px solid {bd}; }}\n'
+    for i, (bg, bd) in enumerate(TAG_COLORS)
+)
 
 QSS = f"""
 QWidget#root, QWidget#workspace {{ background: {BG}; }}
@@ -135,6 +146,15 @@ QPushButton#tileClose {{
     background: transparent; border: none; color: #9a9a9a; font-size: 16px; padding: 0 6px;
 }}
 QPushButton#tileClose:hover {{ color: #e74856; }}
+/* sync-group tag chips (see tags.py / workspace.py) */
+QWidget#tileChips {{ background: transparent; }}
+QLabel#tileTag {{ border-radius: 7px; font-size: 10px; padding: 0 6px; color: {TEXT}; }}
+{_tag_chip_qss}
+/* sync-domain tint: WHERE a keystroke will go while sync is armed. On the
+   header, not the tile frame -- that channel belongs to drop="true". */
+QFrame#tileHeader[sync="peer"] {{ background: #2e2118; }}
+QFrame#tileHeader[sync="source"] {{ background: #33241a; }}
+QFrame#tileHeader[sync="source"] QLabel#tileTitle {{ color: {ACCENT_HI}; }}
 /* pane resizing: the gaps between tiles are draggable splitter handles */
 QSplitter::handle {{ background: transparent; border-radius: 3px; }}
 QSplitter::handle:hover, QSplitter::handle:pressed {{ background: {BORDER_HI}; }}

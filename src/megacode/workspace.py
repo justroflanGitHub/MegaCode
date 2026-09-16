@@ -13,7 +13,7 @@ import logging
 from typing import List, Optional
 
 from PySide6.QtCore import QMimeData, QPoint, Qt, QTimer, Signal, Slot
-from PySide6.QtGui import QDrag
+from PySide6.QtGui import QColor, QCursor, QDrag, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import shells
+from . import tags
 from .chat_widget import ChatWidget
 from .layouts import auto_shape, grid_positions
 from .terminal_widget import TerminalWidget
@@ -45,6 +46,28 @@ _SPLIT_HANDLE = 8
 _TILE_MIN_W, _TILE_MIN_H = 180, 120
 #: How long the "ran in N panes" feedback stays in the toolbar title.
 _STATUS_FLASH_MS = 2000
+
+#: The toolbar's hint strings, verbatim. _refresh_hint_strings() extends
+#: them while any tag exists and restores these exact bytes when none do --
+#: the zero-tag UI must stay identical to the pre-tags app. (Typed here, in
+#: one place, so tests can pin them down instead of chasing literals.)
+_SYNC_TIP_BASE = (
+    "Mirror keyboard input from the focused pane to every other pane\n"
+    "(typing, arrows, nano/vim editing — everything, at once).\n"
+    "Keyboard only: mouse clicks/wheel stay per-pane, since every pane\n"
+    "has its own geometry. Click again to stop mirroring."
+)
+_SYNC_TIP_TAGS = (
+    "\nWith tags: panes sync only within shared tag groups (untagged\n"
+    "panes sync together); lit headers receive your keys."
+)
+_BROADCAST_PLACEHOLDER_BASE = "Command for every pane…"
+_BROADCAST_PLACEHOLDER_TAGS = "Command for every pane · or @tag command…"
+_BROADCAST_TIP_BASE = (
+    "Run this command in every open terminal pane\n"
+    "(Enter or the Run all button; chat tiles are skipped)"
+)
+_BROADCAST_TIP_TAGS = "\nA '@tag' prefix scopes the run to one group."
 
 
 class TileHeader(QFrame):
@@ -70,6 +93,17 @@ class TileHeader(QFrame):
         layout.setSpacing(8)
         layout.addWidget(self.grip)
         layout.addWidget(self.title, 1)
+        # Sync-group tag chips. Hidden while empty so an untagged header is
+        # pixel-identical to a pre-tags one (a visible empty container would
+        # still claim layout spacing), and width-capped so a long tag list
+        # can never raise the tile's -- and the window's -- minimum size.
+        self.chips = QWidget(objectName="tileChips")
+        self._chips_layout = QHBoxLayout(self.chips)
+        self._chips_layout.setContentsMargins(0, 0, 0, 0)
+        self._chips_layout.setSpacing(4)
+        self.chips.setMaximumWidth(150)
+        self.chips.setVisible(False)
+        layout.addWidget(self.chips)
         layout.addWidget(self.close_btn)
 
     def mousePressEvent(self, event) -> None:  # noqa: N802 (Qt signature)
@@ -103,6 +137,70 @@ class TileHeader(QFrame):
         else:
             super().mouseDoubleClickEvent(event)
 
+    def contextMenuEvent(self, event) -> None:  # noqa: N802 (Qt signature)
+        # Defensive, same rule as the double-click above: a pending LEFT press
+        # followed by this right-click must not leave a stale _press_pos that a
+        # later move could misread as a drag start (mousePressEvent seeds only
+        # on the left button, but the press may still be pending).
+        self._press_pos = None
+        self._tile.menuRequested.emit(self._tile.index)
+        event.accept()
+
+    # --- sync-group tag chips -------------------------------------------------
+    #: How many tags get a real chip before the rest collapse into "+N".
+    MAX_CHIPS = 2
+
+    def set_chips(self, tag_list: List[str]) -> None:
+        """Rebuild the chips: the first tags verbatim, the rest as "+N".
+
+        Two chips + a counter is the whole display budget -- the header is a
+        ~24px strip that already carries a title, and more would crowd it.
+        """
+        while self._chips_layout.count():
+            item = self._chips_layout.takeAt(0)
+            if item.widget() is not None:
+                item.widget().deleteLater()
+        used: set = set()
+        for tag in tag_list[: self.MAX_CHIPS]:
+            self._add_chip(tag, tag, tags.tag_class(tag), used)
+        rest = tag_list[self.MAX_CHIPS:]
+        if rest:
+            self._add_chip(f"+{len(rest)}", ", ".join(rest), None, used)
+        self.chips.setVisible(bool(tag_list))
+
+    def _add_chip(self, display: str, tip: str, cls: Optional[int],
+                  used: set) -> None:
+        """One chip label. Colors de-collide per header: if two visible chips
+        hash to the same class, the later one takes the next free class, so
+        neighbors are always distinguishable (tag_class itself stays pure --
+        cross-pane color identity must not shift)."""
+        label = QLabel(objectName="tileTag")
+        label.setToolTip(tip)
+        if cls is None:  # the "+N" counter: first free class
+            cls = 0
+        while cls in used:
+            cls = (cls + 1) % len(tags.TAG_COLORS)
+        used.add(cls)
+        label.setProperty("tagClass", str(cls))
+        # A QLabel's size hint is its text width, so elide to a fixed budget:
+        # the chip then contributes a bounded, tag-count-independent minimum.
+        # The 10px font is set in code AND in QSS -- kept in lockstep so the
+        # elide measurement can never diverge from what actually renders
+        # (eliding with the default font would cut ~20% too soon here).
+        font = label.font()
+        font.setPixelSize(10)
+        label.setFont(font)
+        label.setText(label.fontMetrics().elidedText(
+            display, Qt.TextElideMode.ElideRight, 36))
+        self._chips_layout.addWidget(label)
+
+    def chip_texts(self) -> List[str]:
+        """The chip labels' texts (test helper)."""
+        return [
+            self._chips_layout.itemAt(i).widget().text()
+            for i in range(self._chips_layout.count())
+        ]
+
     def _start_drag(self) -> None:
         self.setCursor(Qt.CursorShape.ClosedHandCursor)
         drag = QDrag(self)
@@ -124,6 +222,11 @@ class TerminalTile(QFrame):
 
     swapRequested = Signal(int, int)  # (target_index, source_index)
     closeRequested = Signal(int)      # (index)
+    menuRequested = Signal(int)       # (index) -- right-click on the header
+    #: (added, removed) -- the first tag that appeared / disappeared in a
+    #: real change; "" for the absent side. Both directions carry the same
+    #: information need: "how big is the group now?"
+    tagsChanged = Signal(str, str)
 
     def __init__(
         self,
@@ -143,6 +246,7 @@ class TerminalTile(QFrame):
         self._label = label
         self._custom_title: Optional[str] = None
         self._drop_target = False
+        self._tags: List[str] = []
 
         self.header = TileHeader(self)
         self.header.setToolTip("Double-click to rename · drag onto another tile to swap")
@@ -194,6 +298,57 @@ class TerminalTile(QFrame):
     def _on_terminal_finished(self) -> None:
         self.refresh_title()
 
+    # --- sync-group tags -------------------------------------------------------
+    def tags(self) -> List[str]:
+        return list(self._tags)
+
+    def set_tags(self, tag_list: List[str]) -> None:
+        """Normalize, dedupe preserving order, store; emit only on real change.
+
+        Tags live on the tile (not the widget, not a registry), so they
+        travel with the live session through drag-swaps and die with the
+        pane -- no second source of identity to keep in sync.
+        """
+        cleaned: List[str] = []
+        for raw in tag_list:
+            t = tags.normalize_tag(raw)
+            if t and t not in cleaned:
+                cleaned.append(t)
+        if cleaned == self._tags:
+            return
+        added = next((t for t in cleaned if t not in self._tags), "")
+        removed = next((t for t in self._tags if t not in cleaned), "")
+        self._tags = cleaned
+        self.header.set_chips(self._tags)
+        tip = "Double-click to rename · drag onto another tile to swap"
+        if self._tags:  # zero tags -> byte-identical tooltip to today
+            tip = f"Tags: {', '.join(self._tags)} · right-click to edit · {tip}"
+        self.header.setToolTip(tip)
+        self.tagsChanged.emit(added, removed)
+
+    def toggle_tag(self, tag: str) -> None:
+        t = tags.normalize_tag(tag)
+        if t is None:
+            return
+        if t in self._tags:
+            self.set_tags([x for x in self._tags if x != t])
+        else:
+            self.set_tags(self._tags + [t])
+
+    def set_sync_state(self, state: str) -> None:
+        """Show 'source' | 'peer' | '' for the sync-domain tint.
+
+        On the HEADER, not the tile frame: the border channel already
+        belongs to the drop="true" swap highlight, and repolishing one
+        small widget is cheaper. Change-guarded: focus moves are frequent.
+        """
+        if self.header.property("sync") == state:
+            return
+        self.header.setProperty("sync", state)
+        for w in (self.header, self.header.title):
+            w.style().unpolish(w)
+            w.style().polish(w)
+
     # --- drag & drop (drop target) ------------------------------------------
     def dragEnterEvent(self, event) -> None:  # noqa: N802 (Qt signature)
         if event.mimeData().hasFormat(_TILE_MIME):
@@ -240,7 +395,16 @@ class WorkspaceView(QWidget):
         self.tiles: List[TerminalTile] = []
         # sync-input mode: every keystroke from the focused pane is mirrored
         # into all the others (tmux synchronize-panes). Toggled per workspace.
+        # With tags in play the fan-out narrows to the focused pane's sync
+        # group (see _share_sync_domain); with zero tags it stays "everyone",
+        # byte-identical to the pre-tags behavior.
         self._sync_keys = False
+
+        # Repaint the sync-domain tint on every focus move: "which panes will
+        # receive my keystrokes?" must be answered without typing first.
+        app = QApplication.instance()
+        if app is not None:
+            app.focusChanged.connect(self._on_focus_changed)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(10, 10, 10, 10)
@@ -286,12 +450,9 @@ class WorkspaceView(QWidget):
 
         # Broadcast bar: one command, executed in every open terminal pane.
         self._broadcast_input = QLineEdit(objectName="broadcastInput")
-        self._broadcast_input.setPlaceholderText("Command for every pane…")
+        self._broadcast_input.setPlaceholderText(_BROADCAST_PLACEHOLDER_BASE)
         self._broadcast_input.setClearButtonEnabled(True)
-        self._broadcast_input.setToolTip(
-            "Run this command in every open terminal pane\n"
-            "(Enter or the Run all button; chat tiles are skipped)"
-        )
+        self._broadcast_input.setToolTip(_BROADCAST_TIP_BASE)
         # Tile drags carry text/plain (the swap mime includes setText), so a
         # missed drop would otherwise type a tile index into the command box.
         self._broadcast_input.setAcceptDrops(False)
@@ -332,12 +493,7 @@ class WorkspaceView(QWidget):
         self._sync_btn = QToolButton(objectName="toolbarBtn")
         self._sync_btn.setText("⇉  Sync input")
         self._sync_btn.setCheckable(True)
-        self._sync_btn.setToolTip(
-            "Mirror keyboard input from the focused pane to every other pane\n"
-            "(typing, arrows, nano/vim editing — everything, at once).\n"
-            "Keyboard only: mouse clicks/wheel stay per-pane, since every pane\n"
-            "has its own geometry. Click again to stop mirroring."
-        )
+        self._sync_btn.setToolTip(_SYNC_TIP_BASE)
         self._sync_btn.toggled.connect(self._on_sync_toggled)
         layout.addWidget(self._sync_btn)
 
@@ -380,31 +536,62 @@ class WorkspaceView(QWidget):
     # --- broadcast (run a command in every pane) -----------------------------
     @Slot()
     def _broadcast(self) -> None:
-        """Run the toolbar command in every live terminal pane.
+        """Run the toolbar command in the targeted live terminal panes.
 
-        Chat tiles are not consoles and exited panes have no prompt left, so
-        both are skipped; the title flashes how many panes actually got it.
+        The default target is every live console pane: chat tiles are not
+        consoles and exited panes have no prompt left, so both are skipped.
+        A "@tag command" prefix scopes the run to one tag group instead --
+        but only when that tag actually exists (an unknown "@tag" stays a
+        literal command, so cmd's "@echo off" keeps working). The title
+        flashes how many panes actually got it.
         """
         command = self._broadcast_input.text().strip()
         if not command:
             return
         prev = QApplication.focusWidget()
-        sent = 0
-        for term in self._terminal_panes():
-            if term.is_dead() or term.has_pending_input():
-                # Appending the command onto a pane's waiting pasted line would
-                # run "<pasted><command>" as ONE line (verified: cmd executes
-                # "echo AAAecho BBB"). Those panes are the Run pasted button's
-                # job; the flash below reports the narrower delivery.
-                continue
+        sel = tags.parse_selector(command)
+        # Appending onto a pane's waiting pasted line would run
+        # "<pasted><command>" as ONE line (verified: cmd executes
+        # "echo AAAecho BBB"). Those panes are the Run pasted button's job;
+        # the flash reports the narrower delivery.
+        live = [
+            t for t in self._terminal_panes()
+            if not t.is_dead() and not t.has_pending_input()
+        ]
+        if sel is not None and sel[0] in self._known_tags():
+            tag, command = sel
+            panes = [t for t in live if tag in self._tags_of(t)]
+            if not panes:
+                # an explicit selector that matches nothing live (e.g. only
+                # a chat tile holds the tag) must run nothing anywhere
+                self._flash_status(f"no live pane tagged '@{tag}'")
+                self._hand_back_focus(prev)
+                return
+            note = f" · @{tag}"
+        elif sel is not None and self._any_tags():
+            # "@nope cmd" with tags around: ran everywhere, but the user
+            # probably aimed at a group -- make the miss visible.
+            panes = live
+            note = f" (no '@{sel[0]}' group)"
+        else:
+            panes = live  # today's path, byte-identical
+            note = ""
+        for term in panes:
             term.run_command(command)
-            sent += 1
-        self._flash_status(f"ran in {sent} pane{'s' if sent != 1 else ''}")
-        # Enter-to-run must not strand the keyboard in the box: a follow-up
-        # keystroke meant for a pane would silently mutate the retained command
-        # and re-run it in EVERY pane. Hand focus back to the pane the user
-        # came from (the click path never left it); nowhere to go back -> the
-        # first tile, matching every other action in this class.
+        self._flash_status(
+            f"ran in {len(panes)} pane{'s' if len(panes) != 1 else ''}{note}"
+        )
+        self._hand_back_focus(prev)
+
+    def _hand_back_focus(self, prev) -> None:
+        """Return the keyboard to the panes after a toolbar action.
+
+        Enter-to-run must not strand the keyboard in the box: a follow-up
+        keystroke meant for a pane would silently mutate the retained command
+        and re-run it in EVERY pane. Hand focus back to the pane the user
+        came from (the click path never left it); nowhere to go back -> the
+        first tile, matching every other action in this class.
+        """
         if (prev is not None and prev is not self._broadcast_input
                 and isinstance(prev, TerminalWidget) and not prev.is_dead()):
             prev.setFocus()
@@ -430,6 +617,9 @@ class WorkspaceView(QWidget):
         Each pane runs its own pasted command; panes without waiting input are
         untouched -- no stray blank lines at empty prompts, no stray Enter
         inside a TUI. The title flashes how many panes actually ran.
+        Deliberately blind to tag groups: pasted input was placed per pane BY
+        HAND, so a group filter here could only subtract Enters the user's
+        own hands arranged.
         """
         prev = QApplication.focusWidget()
         waiting = [
@@ -465,25 +655,231 @@ class WorkspaceView(QWidget):
         self._exec_btn.style().unpolish(self._exec_btn)
         self._exec_btn.style().polish(self._exec_btn)
 
-    # --- sync input (mirror the keyboard to every pane) -----------------------
+    # --- sync input (mirror the keyboard within a pane's sync group) ----------
     @Slot(bool)
     def _on_sync_toggled(self, checked: bool) -> None:
         self._sync_keys = checked
+        if checked and self._any_tags():
+            tile = self._focused_term_tile()
+            if tile is not None:
+                # With tags in play, the audience depends on the focused
+                # pane -- say it up front instead of letting the user find
+                # out by typing. A {a,b} pane drives the union, so list all.
+                group = ",".join(f"@{t}" for t in tile.tags()) or "untagged"
+                n = len(self._sync_domain_terms(tile.terminal))
+                self._flash_status(
+                    f"sync input on · {group} "
+                    f"({n} pane{'s' if n != 1 else ''})"
+                )
+                self._update_sync_tint()
+                return
         self._flash_status("sync input on" if checked else "sync input off")
+        self._update_sync_tint()
 
     def _mirror_input(self, source: TerminalWidget, seq: str, pasted: bool) -> None:
-        """Fan one pane's user input out to the others (sync-input mode).
+        """Fan one pane's user input out to its sync group (sync-input mode).
 
-        Connected per pane in ``_new_tile``. The source never receives its own
-        echo, and ``inject_input`` does not re-emit ``inputSent``, so there is
-        no feedback loop. Only keystrokes/pastes travel: PTY-sized panes render
-        TUIs at their own geometry, so mouse clicks (coordinates!) must not.
+        Connected per pane in ``_new_tile``. With no tags anywhere the group
+        is simply every other live pane -- the pre-tags behavior. The source
+        never receives its own echo, and ``inject_input`` does not re-emit
+        ``inputSent``, so there is no feedback loop. Only keystrokes/pastes
+        travel: PTY-sized panes render TUIs at their own geometry, so mouse
+        clicks (coordinates!) must not.
         """
         if not self._sync_keys:
             return
-        for term in self._terminal_panes():
-            if term is not source and not term.is_dead():
-                term.inject_input(seq, pasted=pasted)
+        for term in self._sync_domain_terms(source):
+            term.inject_input(seq, pasted=pasted)
+
+    # --- sync groups (tag-based) -----------------------------------------------
+    def _tags_of(self, term) -> List[str]:
+        """Tags of the tile hosting ``term``, resolved by widget identity.
+
+        An identity scan (the grid holds a handful of panes) is always
+        correct across swap/close/retag; a cache would need invalidation
+        hooks for zero gain -- and a stale identity is exactly the bug the
+        widget-not-index rule elsewhere in this file exists to avoid.
+        """
+        for tile in self.tiles:
+            if isinstance(tile, TerminalTile) and tile.terminal is term:
+                return tile.tags()
+        return []  # the tile is already gone: crash-proofing only
+
+    def _known_tags(self) -> List[str]:
+        """Every tag in use, first seen over the CURRENT tile order (chat and
+        dead tiles included -- their tags stay organizational). The menu
+        order may reshuffle after a drag-swap; cosmetic, accepted."""
+        out: List[str] = []
+        for tile in self.tiles:
+            if isinstance(tile, TerminalTile):
+                for t in tile.tags():
+                    if t not in out:
+                        out.append(t)
+        return out
+
+    def _any_tags(self) -> bool:
+        return bool(self._known_tags())
+
+    def _share_sync_domain(self, src, dst) -> bool:
+        """Do these two panes belong to one sync group?
+
+        Both untagged -> True (the implicit no-tag group: with zero tags
+        anywhere every pair matches, so the fan-out is byte-identical to the
+        pre-tags app). Exactly one untagged -> False (tagged and untagged
+        panes never cross, in either direction). Otherwise -> any shared
+        tag: a pane tagged {a,b} is a member of both groups at once, so
+        typing there reaches the union of the two audiences.
+        """
+        ta, tb = self._tags_of(src), self._tags_of(dst)
+        if not ta and not tb:
+            return True
+        if not ta or not tb:
+            return False
+        return bool(set(ta) & set(tb))
+
+    def _sync_domain_terms(self, source) -> List[TerminalWidget]:
+        """Every pane that would receive a mirrored keystroke from ``source``.
+
+        Shared by the mirror fan-out AND the header tint, so the tint can
+        never disagree with the real delivery set.
+        """
+        return [
+            t for t in self._terminal_panes()
+            if t is not source and not t.is_dead()
+            and self._share_sync_domain(source, t)
+        ]
+
+    def _focused_term_tile(self) -> Optional[TerminalTile]:
+        focus = QApplication.focusWidget()
+        if focus is None:
+            return None
+        for tile in self.tiles:
+            if (isinstance(tile, TerminalTile) and tile.terminal is focus
+                    and isinstance(tile.terminal, TerminalWidget)
+                    and not tile.terminal.is_dead()):
+                return tile
+        return None
+
+    def _update_sync_tint(self) -> None:
+        """Mark WHERE a keystroke would go while sync is armed.
+
+        The _any_tags() gate keeps the zero-tag workspace pixel-identical to
+        the pre-tags app: with no tags the fan-out is simply "every pane",
+        which the plain armed button already communicates. A lone pane still
+        lights its own source tint (you drive, and you are alone) -- better
+        than looking disarmed. Recomputed on focus moves, the sync toggle,
+        tag changes, pane death, and every _rebuild (add/close/swap).
+        """
+        src = (self._focused_term_tile()
+               if (self._sync_keys and self._any_tags()) else None)
+        peers = (set(self._sync_domain_terms(src.terminal))
+                 if src is not None else set())
+        for tile in self.tiles:
+            if not isinstance(tile, TerminalTile):
+                continue
+            if tile is src:
+                tile.set_sync_state("source")
+            elif tile.terminal in peers:
+                tile.set_sync_state("peer")
+            else:
+                tile.set_sync_state("")
+
+    def _on_focus_changed(self, _old, _new) -> None:
+        if self.tiles:  # focus moves also fire during teardown; stay quiet
+            self._update_sync_tint()
+
+    def _tag_icon(self, tag: str) -> QIcon:
+        pm = QPixmap(10, 10)
+        pm.fill(QColor(tags.TAG_COLORS[tags.tag_class(tag)][1]))
+        return QIcon(pm)  # the same color identity as the header chip
+
+    def _build_tile_menu(self, tile: TerminalTile) -> QMenu:
+        """The header's right-click menu, built fresh per open (tags come
+        and go; a construct-only builder is also offscreen-testable)."""
+        menu = QMenu(self)
+        menu.addSection("Sync group tags")
+        for tag in self._known_tags():
+            act = menu.addAction(self._tag_icon(tag), tag)
+            act.setCheckable(True)
+            act.setChecked(tag in tile.tags())
+            act.toggled.connect(lambda _on, t=tag, tl=tile: tl.toggle_tag(t))
+        menu.addAction("New tag…").triggered.connect(
+            lambda: self._on_new_tag(tile))
+        clear = menu.addAction("Clear tags")
+        clear.setEnabled(bool(tile.tags()))
+        clear.triggered.connect(lambda: tile.set_tags([]))
+        menu.addSeparator()
+        menu.addAction("Rename pane…", tile.begin_rename)
+        menu.addAction("Close pane", lambda: self._on_close_tile(tile.index))
+        return menu
+
+    def _on_tile_menu(self, index: int) -> None:
+        if not (0 <= index < len(self.tiles)):
+            return
+        tile = self.tiles[index]
+        if isinstance(tile, TerminalTile):
+            menu = self._build_tile_menu(tile)
+            menu.exec(QCursor.pos())
+            # The menu is parented to this long-lived view, so without an
+            # explicit delete every right-click would accumulate one QMenu
+            # (and its tile-pinning lambdas) on it for the window's life.
+            menu.deleteLater()
+
+    def _on_new_tag(self, tile: TerminalTile) -> None:
+        prompt = "Tag (letters, digits, '-' or '_'; spaces become '-'):"
+        while True:
+            text, ok = QInputDialog.getText(self, "New sync group tag", prompt)
+            if not ok:
+                return
+            tag = tags.normalize_tag(text)
+            if tag is not None:
+                if tag not in tile.tags():
+                    # naming an existing tag checks it, never unchecks it
+                    tile.toggle_tag(tag)
+                else:
+                    # already checked: the dialog still owes the user an
+                    # answer (the group size), not a silent no-op
+                    self._flash_group_size(tag)
+                return
+            prompt = (f"'{text.strip()}' is not a usable tag (1-16 letters,"
+                      " digits, '-' or '_'; 'echo'/'rem' are reserved):")
+
+    def _flash_group_size(self, tag: str) -> None:
+        n = sum(
+            1 for t in self._terminal_panes()
+            if not t.is_dead() and tag in self._tags_of(t)
+        )
+        self._flash_status(f'group "{tag}": {n} pane{"s" if n != 1 else ""}')
+
+    def _on_tags_changed(self, added: str, removed: str) -> None:
+        """Tags came or went: refresh hints and tint, then flash a recount.
+
+        The recount serves BOTH directions: after untagging, "did the group
+        drop to one pane?" is exactly the information to surface (a count of
+        zero says you dissolved it).
+        """
+        self._refresh_hint_strings()
+        self._update_sync_tint()
+        if added:
+            self._flash_group_size(added)
+        elif removed:
+            self._flash_group_size(removed)
+
+    def _refresh_hint_strings(self) -> None:
+        """Extend the toolbar hints while tags exist; restore them otherwise.
+
+        The discovery surface (@tag selectors, group-scoped sync) should
+        exist only once the user actually has tags -- the zero-tag toolbar
+        keeps the exact pre-tags strings.
+        """
+        if self._any_tags():
+            self._broadcast_input.setPlaceholderText(_BROADCAST_PLACEHOLDER_TAGS)
+            self._broadcast_input.setToolTip(_BROADCAST_TIP_BASE + _BROADCAST_TIP_TAGS)
+            self._sync_btn.setToolTip(_SYNC_TIP_BASE + _SYNC_TIP_TAGS)
+        else:
+            self._broadcast_input.setPlaceholderText(_BROADCAST_PLACEHOLDER_BASE)
+            self._broadcast_input.setToolTip(_BROADCAST_TIP_BASE)
+            self._sync_btn.setToolTip(_SYNC_TIP_BASE)
 
     def _flash_status(self, text: str) -> None:
         self._count_label.setText(text)
@@ -519,6 +915,11 @@ class WorkspaceView(QWidget):
         for _ in range(n):
             self._new_tile(command, label, tile_kind)
         self._update_exec_button()
+        # cleanup() destroyed every tagged tile, so the tag-era toolbar hints
+        # and any stale tint must go back to the zero-tag state (defensive:
+        # the per-tile _rebuild in the loop above already covers it).
+        self._refresh_hint_strings()
+        self._update_sync_tint()
         self._focus_first()
 
     def _new_tile(self, command: str, label: str, kind: str = "terminal") -> TerminalTile:
@@ -528,6 +929,8 @@ class WorkspaceView(QWidget):
         )
         tile.swapRequested.connect(self._on_swap)
         tile.closeRequested.connect(self._on_close_tile)
+        tile.menuRequested.connect(self._on_tile_menu)
+        tile.tagsChanged.connect(self._on_tags_changed)
         if isinstance(tile.terminal, TerminalWidget):
             term = tile.terminal
             # Per-pane hooks for the two broadcast features. The lambda closes
@@ -537,6 +940,8 @@ class WorkspaceView(QWidget):
                 lambda seq, pasted, src=term: self._mirror_input(src, seq, pasted)
             )
             term.pendingChanged.connect(self._update_exec_button)
+            # a peer dying mid-sync must stop being lit as a mirror target
+            term.finished.connect(self._update_sync_tint)
         self.tiles.append(tile)
         self._rebuild()
         return tile
@@ -623,6 +1028,11 @@ class WorkspaceView(QWidget):
                     self._apply_sizes(row_widget, widths)
         else:
             self._restore_sizes(groups, row_widgets, saved)
+        # One choke point covering add/close/swap: tile identity and order
+        # just changed, and closing the last tagged pane must also restore
+        # the zero-tag toolbar hints (a closing tile emits nothing).
+        self._update_sync_tint()
+        self._refresh_hint_strings()
         self._restore_status()
 
     def _apply_sizes(self, splitter: QSplitter, sizes: List[int]) -> None:
@@ -671,6 +1081,11 @@ class WorkspaceView(QWidget):
         # the closed pane may have been the only one holding pasted input
         self._update_exec_button()
         if not self.tiles:
+            # the empty branch skips _rebuild, so the tag-era toolbar hints
+            # are retired here too (latent only -- the launcher hides this
+            # toolbar synchronously -- but the state should not lie)
+            self._refresh_hint_strings()
+            self._update_sync_tint()
             self.all_closed.emit()
         else:
             self._rebuild()

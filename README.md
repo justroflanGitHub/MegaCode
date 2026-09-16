@@ -107,6 +107,24 @@ Each embedded terminal behaves like the classic Windows console:
   consoles stay in lockstep, tmux `synchronize-panes` style. Click again to
   stop. (Keyboard only — mouse clicks stay per-pane, since each pane has its
   own geometry.)
+- **Tag sync groups** — right-click a tile's title bar to open the tag menu:
+  create tags (`fe`, `be`, `deploy`… — lowercase, 1–16 letters/digits/`-`/`_`,
+  Cyrillic welcome) and check them per pane; each tag shows as a small
+  colored chip in the header. Once tags exist, **⇉ Sync input** mirrors only
+  within your group: panes sharing a tag type in lockstep, a pane with two
+  tags joins both groups at once, untagged panes sync among themselves, and
+  tagged/untagged never cross — so several independent groups can be
+  synchronized simultaneously, each driven by typing in any of its panes.
+  While sync is on, the pane you type in lights its header together with
+  every pane that will receive your keys: the lit headers *are* your
+  audience. With no tags anywhere, everything syncs together as before. The
+  broadcast bar also understands a scoped run: `@fe git pull` executes only
+  in the `fe` panes (chat tiles never count as targets); a `@tag` that
+  doesn't exist runs everywhere and says so in the flash, and `@`-style
+  shell lines are never intercepted — `echo`/`rem` can't be tags, so
+  `@echo off` keeps working. Tags travel with the pane across drag-swaps
+  and disappear when it closes; **↵ Run pasted** deliberately ignores
+  groups (your hands placed those commands pane by pane).
 
 ## AI Chat tiles
 
@@ -139,6 +157,7 @@ src/megacode/
   chat_backend.py     # one persistent claude CLI session over stdio (stream-json)
   chat_widget.py      # the AI Chat tile: bubbles, markdown, streaming UI
   workspace.py        # resizable/draggable grid of terminal/chat tiles, in one window
+  tags.py             # pure tag grammar + palette for the tag sync groups
   terminal.py         # separate-windows mode (wt.exe launch + Win32 tiling)
   app.py              # launcher <-> workspace UI
 ```

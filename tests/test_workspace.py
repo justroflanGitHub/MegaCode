@@ -583,3 +583,638 @@ def test_real_widget_mirrored_paste_arms_and_run_all_skips(qapp, monkeypatch):
     ws._execute_pasted()
     assert src._pty.written[-1] == "\r" and dst._pty.written[-1] == "\r"
     assert not ws._exec_btn.isEnabled()
+
+
+# --- tag groups (sync domains + @tag scoped broadcast) ---------------------------
+
+
+class _FakeChat(QWidget):
+    """Stands in for ChatWidget: a tile widget that is NOT a console pane.
+
+    Must be a DIFFERENT class from _FakeTerminal: the workspace decides
+    "console pane or not" via isinstance against TerminalWidget, which the
+    fixture patches to _FakeTerminal.
+    """
+
+    finished = Signal()
+
+    def __init__(self, _cwd, font_size=10):  # noqa: ARG002
+        super().__init__()
+        self.seen = []
+
+    def is_dead(self) -> bool:
+        return False
+
+    def tick(self) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+
+def _focus_pane(ws, i, qapp):
+    """Focus a fake pane for tint tests. QWidget defaults to NoFocus, so the
+    policy must be opted into first (the real widget sets StrongFocus); the
+    existing focus test does exactly the same dance."""
+    ws.tiles[i].terminal.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+    ws.tiles[i].terminal.setFocus()
+    qapp.processEvents()
+
+
+def _sync_states(ws) -> list:
+    """Each tile's header 'sync' property (None before the first tint)."""
+    return [t.header.property("sync") for t in ws.tiles]
+
+
+def test_no_tags_mirror_is_byte_identical_to_today(make_ws):
+    """The hard no-tag contract: with zero tags the fan-out is every pane."""
+    ws = make_ws(3)
+    ws._sync_btn.setChecked(True)
+
+    ws.tiles[0].terminal.inputSent.emit("d", False)
+
+    assert [t.terminal.injected for t in ws.tiles] == [
+        [], [("d", False)], [("d", False)],
+    ]
+
+
+def test_sync_mirrors_only_within_same_tag(make_ws):
+    ws = make_ws(3)
+    ws.tiles[0].set_tags(["a"])
+    ws.tiles[1].set_tags(["a"])
+    ws.tiles[2].set_tags(["b"])
+    ws._sync_btn.setChecked(True)
+
+    ws.tiles[0].terminal.inputSent.emit("d", False)
+
+    assert ws.tiles[1].terminal.injected == [("d", False)]
+    assert ws.tiles[2].terminal.injected == []
+
+
+def test_untagged_source_mirrors_only_untagged_panes(make_ws):
+    ws = make_ws(4)
+    ws.tiles[0].set_tags(["a"])
+    ws.tiles[1].set_tags(["a"])
+
+    ws._sync_btn.setChecked(True)
+    ws.tiles[2].terminal.inputSent.emit("d", False)
+
+    assert ws.tiles[3].terminal.injected == [("d", False)]
+    assert ws.tiles[0].terminal.injected == []
+    assert ws.tiles[1].terminal.injected == []
+
+
+def test_tagged_source_never_reaches_untagged(make_ws):
+    ws = make_ws(3)
+    ws.tiles[0].set_tags(["a"])
+
+    ws._sync_btn.setChecked(True)
+    ws.tiles[0].terminal.inputSent.emit("d", False)
+
+    assert ws.tiles[1].terminal.injected == []
+    assert ws.tiles[2].terminal.injected == []
+
+
+def test_multi_tag_pane_joins_both_domains(make_ws):
+    ws = make_ws(3)
+    ws.tiles[0].set_tags(["a"])
+    ws.tiles[1].set_tags(["a", "b"])
+    ws.tiles[2].set_tags(["b"])
+    ws._sync_btn.setChecked(True)
+
+    ws.tiles[1].terminal.inputSent.emit("x", False)  # drives the union
+    assert ws.tiles[0].terminal.injected == [("x", False)]
+    assert ws.tiles[2].terminal.injected == [("x", False)]
+
+    ws.tiles[0].terminal.inputSent.emit("y", False)  # group a reaches the bridge
+    assert ws.tiles[1].terminal.injected == [("y", False)]
+    assert ws.tiles[2].terminal.injected == [("x", False)]  # b is not in a
+
+
+def test_sync_domain_follows_widget_across_swap(make_ws):
+    """Tags ride the tile, the mirror wiring rides the widget: after a
+    drag-swap the tagged session still mirrors only to its tagged peer."""
+    ws = make_ws(3)
+    ws.tiles[0].set_tags(["a"])
+    ws.tiles[1].set_tags(["a"])
+    tagged, peer = ws.tiles[0].terminal, ws.tiles[1].terminal
+    ws._sync_btn.setChecked(True)
+
+    ws._on_swap(0, 2)  # tagged session moves to index 2
+    assert ws.tiles[2].terminal is tagged
+
+    tagged.inputSent.emit("x", False)
+
+    assert peer.injected == [("x", False)]
+    assert ws.tiles[0].terminal.injected == []  # untagged never crosses
+    assert tagged.injected == []                # no self-echo
+
+
+def test_dead_tagged_pane_not_a_sync_target(make_ws):
+    ws = make_ws(2)
+    ws.tiles[0].set_tags(["a"])
+    ws.tiles[1].set_tags(["a"])
+    ws.tiles[1].terminal.is_dead = lambda: True
+    ws._sync_btn.setChecked(True)
+
+    ws.tiles[0].terminal.inputSent.emit("x", False)
+
+    assert ws.tiles[1].terminal.injected == []
+
+
+def test_new_pane_starts_untagged_and_safe(make_ws):
+    """A fresh pane joins the untagged cohort: its keys can never leak into
+    existing tagged groups until the user tags it."""
+    ws = make_ws(2)
+    ws.tiles[0].set_tags(["a"])
+    ws.tiles[1].set_tags(["a"])
+    ws._sync_btn.setChecked(True)
+    new = ws._new_tile("fake", "term")
+
+    new.terminal.inputSent.emit("k", False)
+    assert all(t.terminal.injected == [] for t in ws.tiles)
+
+    ws.tiles[0].terminal.inputSent.emit("d", False)
+    assert ws.tiles[1].terminal.injected == [("d", False)]
+    assert new.terminal.injected == []
+
+
+def test_run_all_stays_global_when_tags_exist(make_ws):
+    """The button's name is the contract: tags alone never scope Run all."""
+    ws = make_ws(3)
+    ws.tiles[0].set_tags(["x"])
+    ws._broadcast_input.setText("git status")
+
+    ws._broadcast()
+
+    assert [t.terminal.commands for t in ws.tiles] == [["git status\r"]] * 3
+    assert ws._count_label.text() == "ran in 3 panes"  # no suffix
+
+
+def test_run_all_selector_scopes_to_tag(make_ws):
+    ws = make_ws(4)
+    ws.tiles[0].set_tags(["fe"])
+    ws.tiles[1].set_tags(["fe"])
+    ws.tiles[2].set_tags(["be"])
+    ws.tiles[3].set_tags(["be"])
+    ws._broadcast_input.setText("@fe git pull")
+
+    ws._broadcast()
+
+    assert ws.tiles[0].terminal.commands == ["git pull\r"]
+    assert ws.tiles[1].terminal.commands == ["git pull\r"]
+    assert ws.tiles[2].terminal.commands == []
+    assert ws.tiles[3].terminal.commands == []
+    assert ws._count_label.text() == "ran in 2 panes · @fe"
+
+
+def test_run_all_scoped_skips_pending_and_dead_in_group(make_ws):
+    ws = make_ws(3)
+    for t in ws.tiles:
+        t.set_tags(["fe"])
+    ws.tiles[1].terminal.set_pending(True)
+    ws.tiles[2].terminal.is_dead = lambda: True
+    ws._broadcast_input.setText("@fe cmd")
+
+    ws._broadcast()
+
+    assert ws.tiles[0].terminal.commands == ["cmd\r"]
+    assert ws.tiles[1].terminal.commands == []
+    assert ws.tiles[2].terminal.commands == []
+    assert ws._count_label.text() == "ran in 1 pane · @fe"
+
+
+def test_run_all_selector_passes_through_when_tag_unknown_and_no_tags_exist(make_ws):
+    """Zero tags: '@echo off' must run verbatim, exactly like today."""
+    ws = make_ws(2)
+    ws._broadcast_input.setText("@echo off")
+
+    ws._broadcast()
+
+    assert [t.terminal.commands for t in ws.tiles] == [["@echo off\r"]] * 2
+    assert ws._count_label.text() == "ran in 2 panes"
+
+
+def test_run_all_selector_unknown_tag_warns_when_tags_exist(make_ws):
+    """With tags around, a misspelled '@tag' still runs everywhere -- but
+    the flash says the group never existed."""
+    ws = make_ws(2)
+    ws.tiles[0].set_tags(["fe"])
+    ws._broadcast_input.setText("@nope cmd")
+
+    ws._broadcast()
+
+    assert [t.terminal.commands for t in ws.tiles] == [["@nope cmd\r"]] * 2
+    assert "(no '@nope' group)" in ws._count_label.text()
+
+
+def test_run_all_selector_requires_body(make_ws):
+    """A bare '@fe' is not a selector: no body, no scoping."""
+    ws = make_ws(2)
+    ws.tiles[0].set_tags(["fe"])
+    ws._broadcast_input.setText("@fe")
+
+    ws._broadcast()
+
+    assert [t.terminal.commands for t in ws.tiles] == [["@fe\r"]] * 2
+
+
+def test_run_all_selector_with_only_chat_tiles_matching_flashes_no_target(
+        make_ws, monkeypatch):
+    """An explicit selector that matches no live console runs NOTHING."""
+    monkeypatch.setattr(wsm, "ChatWidget", _FakeChat)
+    ws = make_ws(2)
+    chat = ws._new_tile(None, "chat", "chat")
+    chat.set_tags(["fe"])  # organizational tag on a non-console tile
+    ws._broadcast_input.setText("@fe cmd")
+
+    ws._broadcast()
+
+    assert all(t.terminal.commands == [] for t in ws.tiles[:2])
+    assert chat.terminal.seen == []
+    assert ws._count_label.text() == "no live pane tagged '@fe'"
+
+
+def test_scoped_miss_runs_nothing_and_hands_focus_back(make_ws, qapp, monkeypatch):
+    """The scoped-empty exit must not strand the keyboard in the box."""
+    monkeypatch.setattr(wsm, "ChatWidget", _FakeChat)
+    ws = make_ws(2)
+    for t in ws.tiles:
+        t.terminal.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+    ws._new_tile(None, "chat", "chat").set_tags(["fe"])
+    ws.tiles[0].terminal.setFocus()
+    qapp.processEvents()
+    ws._broadcast_input.setText("@fe cmd")
+
+    ws._broadcast()
+
+    assert QApplication.focusWidget() is ws.tiles[0].terminal
+
+
+def test_run_pasted_ignores_groups(make_ws):
+    """Pastes are hand-placed per pane: Run pasted fires every waiting pane,
+    whatever their tags."""
+    ws = make_ws(2)
+    ws.tiles[0].set_tags(["a"])
+    ws.tiles[1].set_tags(["b"])
+    ws.tiles[0].terminal.set_pending(True)
+    ws.tiles[1].terminal.set_pending(True)
+
+    ws._execute_pasted()
+
+    assert [t.terminal.commands for t in ws.tiles] == [["\r"], ["\r"]]
+
+
+def test_multiline_paste_still_scopes(make_ws):
+    """A pasted multi-line "@fe ..." must not silently degrade into a run
+    in EVERY pane (the interior newline must not defeat the selector)."""
+    ws = make_ws(3)
+    ws.tiles[0].set_tags(["fe"])
+    ws.tiles[1].set_tags(["fe"])
+    ws._broadcast_input.setText("@fe git pull\nnpm test")
+
+    ws._broadcast()
+
+    assert ws.tiles[0].terminal.commands == ["git pull\nnpm test\r"]
+    assert ws.tiles[1].terminal.commands == ["git pull\nnpm test\r"]
+    assert ws.tiles[2].terminal.commands == []
+    assert ws._count_label.text() == "ran in 2 panes · @fe"
+
+
+def test_chat_tile_sharing_tag_never_receives_mirror(make_ws, monkeypatch):
+    """A chat tile can carry the same tag as the source pane; it must never
+    receive mirrored keys (organizational tags only)."""
+    monkeypatch.setattr(wsm, "ChatWidget", _FakeChat)
+    ws = make_ws(2)
+    chat = ws._new_tile(None, "chat", "chat")
+    ws.tiles[0].set_tags(["fe"])
+    ws.tiles[1].set_tags(["fe"])
+    chat.set_tags(["fe"])
+    ws._sync_btn.setChecked(True)
+
+    ws.tiles[0].terminal.inputSent.emit("x", False)
+
+    assert ws.tiles[1].terminal.injected == [("x", False)]
+    assert chat.terminal.seen == []
+
+
+# --- tag model, chips, menu, hints ------------------------------------------------
+
+
+def test_tile_tag_api_dedups_and_signals(make_ws):
+    ws = make_ws(1)
+    tile = ws.tiles[0]
+    seen = []
+    tile.tagsChanged.connect(lambda a, r: seen.append((a, r)))
+
+    tile.set_tags(["a", "A ", "b"])  # 'A ' normalizes onto the first 'a'
+    assert tile.tags() == ["a", "b"]
+    assert seen == [("a", "")]
+
+    tile.set_tags(["a", "b"])  # no-op set: no signal
+    assert seen == [("a", "")]
+
+    tile.toggle_tag("b")  # removal
+    assert tile.tags() == ["a"]
+    assert seen[-1] == ("", "b")
+
+    tile.set_tags([])  # clearing the last
+    assert tile.tags() == []
+    assert seen[-1] == ("", "a")
+
+
+def test_known_tags_first_seen_order(make_ws):
+    ws = make_ws(2)
+    ws.tiles[0].set_tags(["z", "q"])
+    ws.tiles[1].set_tags(["q", "m"])
+    assert ws._known_tags() == ["z", "q", "m"]
+
+
+def test_closing_last_tagged_pane_drops_tag_and_restores_hints(make_ws, qapp):
+    """Tags die with the pane -- and the tag-era toolbar hints must revert
+    through the close path too (a closing tile emits nothing)."""
+    ws = make_ws(2)
+    ws.tiles[1].set_tags(["solo"])
+    assert ws._known_tags() == ["solo"]
+    assert ws._broadcast_input.placeholderText() == wsm._BROADCAST_PLACEHOLDER_TAGS
+
+    ws._on_close_tile(1)
+    qapp.processEvents()
+
+    assert ws._known_tags() == []
+    assert ws._broadcast_input.placeholderText() == wsm._BROADCAST_PLACEHOLDER_BASE
+    assert ws._sync_btn.toolTip() == wsm._SYNC_TIP_BASE
+    assert ws._broadcast_input.toolTip() == wsm._BROADCAST_TIP_BASE
+
+
+def test_hint_constants_have_no_invisible_characters():
+    """Typed here, never copy-pasted: zero-width chars must not ship in a
+    tooltip (a workflow spec once smuggled one in)."""
+    for s in (wsm._SYNC_TIP_BASE, wsm._SYNC_TIP_TAGS,
+              wsm._BROADCAST_PLACEHOLDER_BASE, wsm._BROADCAST_PLACEHOLDER_TAGS,
+              wsm._BROADCAST_TIP_BASE, wsm._BROADCAST_TIP_TAGS):
+        assert "​" not in s and "﻿" not in s
+
+
+def test_hints_extend_only_while_tags_exist(make_ws):
+    ws = make_ws(2)
+    # zero tags: byte-identical pre-tags toolbar
+    assert ws._broadcast_input.placeholderText() == "Command for every pane…"
+    assert ws._sync_btn.toolTip() == wsm._SYNC_TIP_BASE
+
+    ws.tiles[0].set_tags(["fe"])
+    assert ws._broadcast_input.placeholderText() == wsm._BROADCAST_PLACEHOLDER_TAGS
+    assert ws._sync_btn.toolTip() == wsm._SYNC_TIP_BASE + wsm._SYNC_TIP_TAGS
+    assert ws._broadcast_input.toolTip() == wsm._BROADCAST_TIP_BASE + wsm._BROADCAST_TIP_TAGS
+
+    ws.tiles[0].set_tags([])  # the last tag went away: hints revert
+    assert ws._broadcast_input.placeholderText() == wsm._BROADCAST_PLACEHOLDER_BASE
+    assert ws._sync_btn.toolTip() == wsm._SYNC_TIP_BASE
+
+
+def test_tag_menu_actions_toggle_membership(make_ws, monkeypatch):
+    ws = make_ws(2)
+    ws.tiles[1].set_tags(["fe"])
+
+    menu = ws._build_tile_menu(ws.tiles[0])
+    fe = next(a for a in menu.actions() if a.text() == "fe")
+    assert not fe.isChecked()
+    fe.toggle()
+    assert ws.tiles[0].tags() == ["fe"]
+
+    # "New tag…": the dialog path adds the typed tag
+    monkeypatch.setattr(
+        wsm.QInputDialog, "getText",
+        staticmethod(lambda *a, **k: ("zz", True)),
+    )
+    ws._on_new_tag(ws.tiles[0])
+    assert "zz" in ws.tiles[0].tags()
+
+    # naming an already-checked tag never unchecks it, and still answers
+    monkeypatch.setattr(
+        wsm.QInputDialog, "getText",
+        staticmethod(lambda *a, **k: ("fe", True)),
+    )
+    ws._on_new_tag(ws.tiles[0])
+    assert "fe" in ws.tiles[0].tags()
+    assert 'group "fe"' in ws._count_label.text()
+
+
+def test_clear_tags_menu_entry(make_ws):
+    ws = make_ws(1)
+    ws.tiles[0].set_tags(["a", "b"])
+    menu = ws._build_tile_menu(ws.tiles[0])
+
+    clear = next(a for a in menu.actions() if a.text() == "Clear tags")
+    assert clear.isEnabled()
+    clear.trigger()
+    assert ws.tiles[0].tags() == []
+
+
+def test_tag_flash_reports_group_size(make_ws):
+    ws = make_ws(2)
+    ws.tiles[0].set_tags(["build"])
+    assert ws._count_label.text() == 'group "build": 1 pane'
+    ws.tiles[1].set_tags(["build"])
+    assert ws._count_label.text() == 'group "build": 2 panes'
+    # removal recounts too -- dropping to zero says the group dissolved
+    ws.tiles[1].toggle_tag("build")
+    assert ws._count_label.text() == 'group "build": 1 pane'
+    ws.tiles[0].toggle_tag("build")
+    assert ws._count_label.text() == 'group "build": 0 panes'
+
+
+def test_chips_render_tags_and_hide_when_untagged(make_ws, qapp):
+    ws = make_ws(1)
+    tile = ws.tiles[0]
+
+    assert not tile.header.chips.isVisible()  # pixel-identical untagged header
+    assert tile.header.toolTip() == (
+        "Double-click to rename · drag onto another tile to swap"
+    )
+
+    # short tags: whether a long tag elides is font-metric dependent; the
+    # elide path itself is covered by the minimum-size test's 16-char tags
+    tile.set_tags(["fe", "be", "ci", "dx"])
+    qapp.processEvents()
+    assert tile.header.chips.isVisible()
+    assert tile.header.chip_texts() == ["fe", "be", "+2"]
+    chips_tip = tile.header._chips_layout.itemAt(2).widget().toolTip()
+    assert chips_tip == "ci, dx"
+    assert tile.header.toolTip().startswith("Tags: fe, be, ci, dx ·")
+
+    tile.set_tags([])
+    qapp.processEvents()
+    assert not tile.header.chips.isVisible()
+    assert tile.header.toolTip() == (
+        "Double-click to rename · drag onto another tile to swap"
+    )
+
+
+def test_visible_chips_in_one_header_never_share_a_color_class(make_ws):
+    from megacode import tags as tagmod
+
+    # find two tags that hash to the same color class...
+    seen: dict = {}
+    colliding = None
+    for i in range(500):
+        t = f"tag{i}"
+        c = tagmod.tag_class(t)
+        if c in seen:
+            colliding = (seen[c], t)
+            break
+        seen[c] = t
+    assert colliding is not None  # 6 classes, pigeonhole long before 500
+
+    ws = make_ws(1)
+    ws.tiles[0].set_tags([*colliding, "zzz"])
+    classes = [
+        ws.tiles[0].header._chips_layout.itemAt(i).widget().property("tagClass")
+        for i in range(3)
+    ]
+    assert len(set(classes)) == 3  # de-collided: all three distinguishable
+
+
+def test_chips_cannot_raise_tile_minimum_without_bound(make_ws):
+    """A long tag list must not inflate the header's -- and so the tile's
+    and window's -- minimum width: the display is capped, not the model."""
+    ws = make_ws(1)
+    base = ws.tiles[0].header.minimumSizeHint().width()
+
+    ws.tiles[0].set_tags(["a" * 16] * 9)   # 9 tags -> 2 chips + "+7"
+    nine = ws.tiles[0].header.minimumSizeHint().width()
+    ws.tiles[0].set_tags(["a" * 16] * 3)   # 3 tags -> same 2 chips + "+1"
+    three = ws.tiles[0].header.minimumSizeHint().width()
+
+    assert three == nine              # the cap does not grow with the count
+    assert nine < base + 160          # and stays well inside a tile's floor
+
+
+def test_relaunch_clears_tags_tint_and_hints(make_ws, qapp):
+    ws = make_ws(2)
+    ws.tiles[0].set_tags(["fe"])
+    ws.tiles[1].set_tags(["fe"])
+    ws._sync_btn.setChecked(True)
+    assert ws._known_tags() == ["fe"]
+
+    ws.start(2, "fake", os.getcwd(), font_size=10, label="term")
+    qapp.processEvents()
+
+    assert all(t.tags() == [] for t in ws.tiles)
+    assert ws._known_tags() == []
+    assert not any(_sync_states(ws))  # no stale tint
+    assert ws._broadcast_input.placeholderText() == wsm._BROADCAST_PLACEHOLDER_BASE
+    assert ws._sync_btn.toolTip() == wsm._SYNC_TIP_BASE
+
+
+# --- sync tint (WHERE a keystroke will go) ----------------------------------------
+
+
+def test_sync_tint_marks_domain_only_when_tags_exist(make_ws, qapp):
+    ws = make_ws(3)
+    ws.tiles[0].set_tags(["a"])
+    ws.tiles[1].set_tags(["a"])
+    ws.tiles[2].set_tags(["b"])
+    ws._sync_btn.setChecked(True)
+    _focus_pane(ws, 0, qapp)
+
+    assert _sync_states(ws) == ["source", "peer", ""]
+
+    _focus_pane(ws, 2, qapp)  # the b pane drives alone: it is its own group
+    assert _sync_states(ws) == ["", "", "source"]
+
+    ws._sync_btn.setChecked(False)  # sync off: everything clears
+    assert _sync_states(ws) == ["", "", ""]
+
+
+def test_zero_tags_never_tint(make_ws, qapp):
+    """The no-tag contract: no header may light without tags, ever."""
+    ws = make_ws(3)
+    ws._sync_btn.setChecked(True)
+    _focus_pane(ws, 0, qapp)
+
+    assert not any(_sync_states(ws))
+
+
+def test_lone_untagged_pane_shows_source_tint_only(make_ws, qapp):
+    """A lone untagged pane drives nobody, but its own source tint still
+    lights: 'you drive, and you are alone' beats looking disarmed."""
+    ws = make_ws(3)
+    ws.tiles[0].set_tags(["a"])
+    ws.tiles[1].set_tags(["a"])
+    ws._sync_btn.setChecked(True)
+    _focus_pane(ws, 2, qapp)
+
+    assert _sync_states(ws) == ["", "", "source"]
+
+
+def test_sync_tint_clears_on_focus_loss(make_ws, qapp):
+    ws = make_ws(3)
+    ws.tiles[0].set_tags(["a"])
+    ws.tiles[1].set_tags(["a"])
+    ws._sync_btn.setChecked(True)
+    _focus_pane(ws, 0, qapp)
+    assert _sync_states(ws) == ["source", "peer", ""]
+
+    ws._broadcast_input.setFocus()  # keyboard left the panes
+    qapp.processEvents()
+
+    assert not any(_sync_states(ws))
+
+
+def test_sync_tint_updates_when_tags_change_while_armed(make_ws, qapp):
+    """Untagging a pane mid-sync must unlight it in the same instant its
+    keys stop flowing -- the tint may never disagree with delivery."""
+    ws = make_ws(3)
+    ws.tiles[0].set_tags(["a"])
+    ws.tiles[1].set_tags(["a"])
+    ws._sync_btn.setChecked(True)
+    _focus_pane(ws, 0, qapp)
+    assert _sync_states(ws) == ["source", "peer", ""]
+
+    ws.tiles[1].toggle_tag("a")  # pane 1 leaves the group under armed sync
+
+    assert _sync_states(ws) == ["source", "", ""]
+    ws.tiles[0].terminal.inputSent.emit("x", False)
+    assert ws.tiles[1].terminal.injected == []  # delivery agrees with the tint
+
+
+def test_sync_tint_clears_when_peer_dies_mid_sync(make_ws, qapp):
+    """A peer's process exiting (finished) must unlight it: the tint may
+    not advertise a mirror target the fan-out just excluded."""
+    ws = make_ws(2)
+    ws.tiles[0].set_tags(["a"])
+    ws.tiles[1].set_tags(["a"])
+    ws._sync_btn.setChecked(True)
+    _focus_pane(ws, 0, qapp)
+    assert _sync_states(ws) == ["source", "peer"]
+
+    dead = ws.tiles[1].terminal
+    dead.is_dead = lambda: True   # the real widget flips _dead BEFORE emitting
+    dead.finished.emit()
+
+    assert _sync_states(ws) == ["source", ""]
+    ws.tiles[0].terminal.inputSent.emit("x", False)
+    assert dead.injected == []
+
+
+def test_sync_toggle_flash_names_the_focused_group(make_ws, qapp):
+    ws = make_ws(3)
+    ws.tiles[0].set_tags(["a"])
+    ws.tiles[1].set_tags(["a"])
+    _focus_pane(ws, 0, qapp)
+
+    ws._sync_btn.setChecked(True)
+
+    assert ws._count_label.text() == "sync input on · @a (1 pane)"
+
+    _focus_pane(ws, 2, qapp)  # untagged focused: the group has a name too
+    ws._sync_btn.setChecked(False)
+    ws._sync_btn.setChecked(True)
+    assert ws._count_label.text() == "sync input on · untagged (0 panes)"
+
+    ws.tiles[0].set_tags([])  # zero tags again: today's exact string
+    ws.tiles[1].set_tags([])
+    ws._sync_btn.setChecked(False)
+    ws._sync_btn.setChecked(True)
+    assert ws._count_label.text() == "sync input on"
