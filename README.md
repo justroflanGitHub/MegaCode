@@ -3,6 +3,41 @@
 Launch several **Claude Code** sessions at once and manage them in a single
 window — tiled, and **drag-to-swap**.
 
+One window for every terminal you operate, built for people who live in
+terminals: **DevOps engineers**, **software developers**, **vibe-coders**
+and **system administrators**.
+
+## Who it's for
+
+- **DevOps engineers** — one keystroke across every pane. Type a command in
+  the toolbar and **▶ Run all** executes it in every terminal at once;
+  **tag groups** (`fe`, `be`, `deploy`…) scope it to exactly the right panes
+  (`@be systemctl status app`), and **⇉ Sync input** keeps whole fleets
+  typing in lockstep, tmux `synchronize-panes` style — even across several
+  linked MegaCode windows. Keep the deploy in one pane and the log tails in
+  the others, all visible at the same time.
+- **Software developers** — frontend, backend, database shell and test
+  runner side by side in one window instead of five alt-tabbed consoles.
+  Panes resize tmux-style, swap by drag **without restarting the session**,
+  get human names (`fe`, `api`, `db`), and the arrangement survives adding,
+  closing and swapping tiles. Run the test suite in every working copy at
+  once and watch which one breaks.
+- **Vibe-coders** — run several **Claude Code** agents in parallel tiles and
+  stay in control: paste a different prompt into each pane and submit them
+  all in the same instant with **↵ Run pasted**, broadcast a follow-up to
+  every agent with **▶ Run all**. The **AI Chat** tile is a web-style chat
+  (streaming markdown, model & reasoning-effort pickers, drag-and-drop file
+  access grants) for the tasks that don't need a whole terminal — no
+  alt-tabbing, no lost context.
+- **System administrators** — a real console for daily work: ~10 000-line
+  scrollback, QuickEdit select/copy/paste, per-pane choice of shell or
+  custom command. Portable builds run **without installing anything**: a
+  single `.exe` on Windows, an offline `.deb` for air-gapped Astra/Debian
+  hosts, a self-contained tarball for any Linux with glibc ≥ 2.28. No cloud,
+  no accounts, no telemetry — the cross-window link is a per-user
+  authenticated local pipe, and only mirrored keystrokes ever leave the
+  process.
+
 Runs on **Windows 10/11** and, from this port, natively on **Astra Linux SE
 1.7.6** (Debian-10 base, system python3 3.7) — see **README-ASTRA.md** for
 the Astra install (including air-gapped). One source tree serves both:
@@ -40,6 +75,20 @@ Pick **2, 3, 4 or 6** instances; the grid shape is:
 
 (Add/remove terminals dynamically and the grid auto-tiles a near-square shape.)
 
+## Install (ready builds)
+
+Grab a build from [Releases](https://github.com/justroflanGitHub/MegaCode/releases/latest)
+— nothing to install on Windows, no internet needed on Astra:
+
+| Platform | File | How to run |
+|-----------|------|------------|
+| Windows 10/11 x64 | `MegaCode-<ver>-windows-x64.exe` | portable — just run it |
+| Astra Linux SE 1.7.6 / Debian-10-era | `megacode_<ver>-1_amd64.deb` | `sudo apt install ./megacode_<ver>-1_amd64.deb`, then `megacode` (offline/air-gap OK) |
+| Any Linux x64 with glibc ≥ 2.28 | `megacode-<ver>-linux-amd64.tar.gz` | unpack, run `MegaCode/MegaCode` |
+
+`claude` on `PATH` is needed for Claude Code panes and AI Chat tiles; plain
+shells work without it.
+
 ## Requirements (runtime)
 
 - **Windows 10/11** (uses ConPTY, the Win32 API and Windows Terminal), or
@@ -68,7 +117,7 @@ On Linux/Astra from a checkout:
 ```
 
 Produces a single `dist/MegaCode.exe` (no console window, no Python install
-needed), ~53 MB.
+needed), ~46 MB.
 
 ## How the workspace works
 
@@ -191,17 +240,24 @@ swap and close them like terminals.
 src/megacode/
   layouts.py          # pure tiling math (unit-tested) + grid shape helpers
   win32_helpers.py    # ctypes wrappers for the separate-windows mode
+  posix_helpers.py    # their POSIX twins (Linux)
+  plat_helpers.py     # platform facade: win32_helpers or posix_helpers
   conpty.py           # ConPTY wrapper around pywinpty (spawn/read/write/resize)
+  unixpty.py          # Unix PTY backend (os.openpty + subprocess)
   terminal_widget.py  # embeddable terminal: ConPTY + pyte + QPainter + keys
   chat_backend.py     # one persistent claude CLI session over stdio (stream-json)
   chat_widget.py      # the AI Chat tile: bubbles, markdown, streaming UI
   workspace.py        # resizable/draggable grid of terminal/chat tiles, in one window
+  themes.py           # color schemes (themes)
+  runtime_env.py      # boot-time environment setup, before Qt imports
+  childenv.py         # child-process env hygiene (strips frozen-bundle LD_LIBRARY_PATH)
   tags.py             # pure tag grammar + palette for the tag sync groups
   sync_protocol.py    # wire grammar for linked windows (pure framing + validation)
   sync_security.py    # per-user link state: secret rotation, settings, atomic writes
   sync_bus.py         # the cross-window link: QLockFile-elected hub + pipe clients
   remote_registry.py  # what the other linked windows look like (tags/panes/names)
   terminal.py         # separate-windows mode (wt.exe launch + Win32 tiling)
+  terminal_posix.py   # separate-windows mode on Linux (xterm/wmctrl, qterminal/konsole)
   app.py              # launcher <-> workspace UI
 ```
 
