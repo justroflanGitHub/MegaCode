@@ -1,6 +1,6 @@
 [project]
 name = "megacode"
-version = "0.1.0"
+version = "1.1.0"
 description = "Launch and tile multiple Claude Code sessions — embedded panes on Windows and Linux (Astra), or tiled external terminal windows."
 readme = "README.md"
 # 3.7 floor = Astra Linux SE 1.7.6's system python3 (Debian-10 base); the

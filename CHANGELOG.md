@@ -6,6 +6,24 @@ All notable changes to MegaCode are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.1.0] — 2026-09-28
+
+Native Linux port, cross-window sync, and the frozen-bundle childenv fix.
+
+### Added
+
+- **Native Linux support**: POSIX PTY backend (`unixpty`, `terminal_posix`,
+  `posix_helpers`) alongside the Windows ConPTY/winpty pair — the same
+  embedded-terminal workspace runs on Linux (built for Astra Linux SE 1.7.6
+  on a debian:10 base).
+- **Cross-window sync**: separately launched MegaCode windows synchronize
+  over a local pipe — left-click mirrors every window, right-click scopes
+  by tag (`sync_bus`, `sync_protocol`, `sync_security`).
+- **Themes**, platform helpers (`plat_helpers`), runtime environment and
+  remote-registry modules.
+- **Packaging**: `.deb` (offline-installable, only libc6 + host fontconfig
+  required), `.desktop` entry, `install-astra.sh`, portable onedir bundle.
+
 ### Fixed
 
 - **Frozen-bundle `LD_LIBRARY_PATH` leaked into every child process.** The
