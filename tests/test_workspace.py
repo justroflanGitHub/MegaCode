@@ -14,7 +14,12 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest  # noqa: E402
 from PySide6.QtCore import Qt, Signal  # noqa: E402
-from PySide6.QtWidgets import QApplication, QSplitter, QWidget  # noqa: E402
+from PySide6.QtWidgets import (  # noqa: E402
+    QApplication,
+    QSplitter,
+    QToolButton,
+    QWidget,
+)
 
 import megacode.workspace as wsm  # noqa: E402
 
@@ -364,6 +369,27 @@ def test_add_tile_restores_flashed_status(make_ws):
     assert ws._count_label.text() == "MegaCode · 2 panes"
 
 
+def test_add_button_plain_click_adds_default_shell_kind(make_ws, monkeypatch):
+    """The toolbar's Add button adds the platform's default shell (cmd on
+    Windows, bash on Astra) -- the same kind the launcher preselects, not
+    claude: the user asked for a shell by default."""
+    import megacode.shells as shells
+
+    resolved = []
+    monkeypatch.setattr(
+        wsm.shells, "resolve", lambda kind, custom=None: resolved.append(kind)
+        or "/bin/fake-default-shell")
+    ws = make_ws(1)
+    before = len(ws.tiles)
+
+    ws._add_btn.click()
+
+    assert len(ws.tiles) == before + 1
+    assert resolved == [shells.DEFAULT_KIND]
+    # the tile is labeled with the default kind, not "claude"
+    assert shells.label_for(shells.DEFAULT_KIND) in ws.tiles[-1]._label
+
+
 # --- run pasted (Enter in every pane that is holding input) ---------------------
 
 
@@ -533,6 +559,7 @@ class _FakeRealPty:
     """No child process; output is fed by the test, writes are recorded."""
 
     alive = True
+    LNM_WORKAROUND = True
 
     def __init__(self, *_a, **_k) -> None:
         self.written: List[str] = []
@@ -638,7 +665,10 @@ def test_no_tags_mirror_is_byte_identical_to_today(make_ws):
     ]
 
 
-def test_sync_mirrors_only_within_same_tag(make_ws):
+def test_left_click_arm_mirrors_across_tag_groups(make_ws):
+    """The new left-click contract: with tags around, a plain click mirrors
+    to EVERY pane -- tag groups are the right-click menu's business, not the
+    click's. (Zero tags stay covered by the byte-identical test above.)"""
     ws = make_ws(3)
     ws.tiles[0].set_tags(["a"])
     ws.tiles[1].set_tags(["a"])
@@ -647,11 +677,11 @@ def test_sync_mirrors_only_within_same_tag(make_ws):
 
     ws.tiles[0].terminal.inputSent.emit("d", False)
 
-    assert ws.tiles[1].terminal.injected == [("d", False)]
-    assert ws.tiles[2].terminal.injected == []
+    assert ws.tiles[1].terminal.injected == [("d", False)]  # same group
+    assert ws.tiles[2].terminal.injected == [("d", False)]  # other group too
 
 
-def test_untagged_source_mirrors_only_untagged_panes(make_ws):
+def test_untagged_source_reaches_tagged_panes(make_ws):
     ws = make_ws(4)
     ws.tiles[0].set_tags(["a"])
     ws.tiles[1].set_tags(["a"])
@@ -660,45 +690,18 @@ def test_untagged_source_mirrors_only_untagged_panes(make_ws):
     ws.tiles[2].terminal.inputSent.emit("d", False)
 
     assert ws.tiles[3].terminal.injected == [("d", False)]
-    assert ws.tiles[0].terminal.injected == []
-    assert ws.tiles[1].terminal.injected == []
+    assert ws.tiles[0].terminal.injected == [("d", False)]
+    assert ws.tiles[1].terminal.injected == [("d", False)]
 
 
-def test_tagged_source_never_reaches_untagged(make_ws):
-    ws = make_ws(3)
-    ws.tiles[0].set_tags(["a"])
-
-    ws._sync_btn.setChecked(True)
-    ws.tiles[0].terminal.inputSent.emit("d", False)
-
-    assert ws.tiles[1].terminal.injected == []
-    assert ws.tiles[2].terminal.injected == []
-
-
-def test_multi_tag_pane_joins_both_domains(make_ws):
-    ws = make_ws(3)
-    ws.tiles[0].set_tags(["a"])
-    ws.tiles[1].set_tags(["a", "b"])
-    ws.tiles[2].set_tags(["b"])
-    ws._sync_btn.setChecked(True)
-
-    ws.tiles[1].terminal.inputSent.emit("x", False)  # drives the union
-    assert ws.tiles[0].terminal.injected == [("x", False)]
-    assert ws.tiles[2].terminal.injected == [("x", False)]
-
-    ws.tiles[0].terminal.inputSent.emit("y", False)  # group a reaches the bridge
-    assert ws.tiles[1].terminal.injected == [("y", False)]
-    assert ws.tiles[2].terminal.injected == [("x", False)]  # b is not in a
-
-
-def test_sync_domain_follows_widget_across_swap(make_ws):
+def test_scoped_arm_follows_widget_across_swap(make_ws):
     """Tags ride the tile, the mirror wiring rides the widget: after a
-    drag-swap the tagged session still mirrors only to its tagged peer."""
+    drag-swap the scoped arm still delivers only inside its tag group."""
     ws = make_ws(3)
     ws.tiles[0].set_tags(["a"])
     ws.tiles[1].set_tags(["a"])
     tagged, peer = ws.tiles[0].terminal, ws.tiles[1].terminal
-    ws._sync_btn.setChecked(True)
+    ws._apply_sync(True, "a", None)
 
     ws._on_swap(0, 2)  # tagged session moves to index 2
     assert ws.tiles[2].terminal is tagged
@@ -706,7 +709,7 @@ def test_sync_domain_follows_widget_across_swap(make_ws):
     tagged.inputSent.emit("x", False)
 
     assert peer.injected == [("x", False)]
-    assert ws.tiles[0].terminal.injected == []  # untagged never crosses
+    assert ws.tiles[0].terminal.injected == []  # untagged never in @a
     assert tagged.injected == []                # no self-echo
 
 
@@ -722,21 +725,23 @@ def test_dead_tagged_pane_not_a_sync_target(make_ws):
     assert ws.tiles[1].terminal.injected == []
 
 
-def test_new_pane_starts_untagged_and_safe(make_ws):
-    """A fresh pane joins the untagged cohort: its keys can never leak into
-    existing tagged groups until the user tags it."""
+def test_new_untagged_pane_joins_the_all_arm_only(make_ws):
+    """A fresh pane receives mirrored keys under the left-click (all) arm --
+    it is "every pane" -- but stays outside a scoped arm until tagged."""
     ws = make_ws(2)
     ws.tiles[0].set_tags(["a"])
     ws.tiles[1].set_tags(["a"])
     ws._sync_btn.setChecked(True)
     new = ws._new_tile("fake", "term")
 
-    new.terminal.inputSent.emit("k", False)
-    assert all(t.terminal.injected == [] for t in ws.tiles)
-
     ws.tiles[0].terminal.inputSent.emit("d", False)
     assert ws.tiles[1].terminal.injected == [("d", False)]
-    assert new.terminal.injected == []
+    assert new.terminal.injected == [("d", False)]  # all means all
+
+    ws._pick_sync_scope("a")
+    ws.tiles[0].terminal.inputSent.emit("k", False)
+    assert ws.tiles[1].terminal.injected == [("d", False), ("k", False)]
+    assert new.terminal.injected == [("d", False)]  # scoped keeps it out
 
 
 def test_run_all_stays_global_when_tags_exist(make_ws):
@@ -1075,6 +1080,72 @@ def test_visible_chips_in_one_header_never_share_a_color_class(make_ws):
     assert len(set(classes)) == 3  # de-collided: all three distinguishable
 
 
+@pytest.mark.parametrize("scheme_name", sorted(wsm.themes.SCHEMES))
+def test_chip_pixels_follow_the_scheme_palette(make_ws, qapp, scheme_name):
+    """Offscreen pixel proof that a chip renders with ITS scheme's palette:
+    the sampled interior is the class background, and the LABEL's glyphs
+    read as the class foreground against it -- dark-on-pastel in
+    paper-light, light-on-dark in the dark themes. Exercises the whole
+    chain (palette slot -> QSS rule -> property selector), not just the
+    constants."""
+    from PySide6.QtGui import QColor
+    from PySide6.QtWidgets import QLabel
+
+    from megacode import tags as tagmod
+    from megacode import themes as th
+
+    def cheb(a: QColor, b: QColor) -> int:
+        return max(abs(a.red() - b.red()), abs(a.green() - b.green()),
+                   abs(a.blue() - b.blue()))
+
+    was = th.active_name()
+    th.set_active(scheme_name)
+    try:
+        ws = make_ws(1)
+        ws.setStyleSheet(th.build_qss(th.SCHEMES[scheme_name]))
+        ws.tiles[0].set_tags(["build"])
+        qapp.processEvents()
+        chip = ws.tiles[0].header._chips_layout.itemAt(0).widget()
+        bg, _border, fg = th.tag_colors()[tagmod.tag_class("build")]
+
+        # interior sample at mid-height: past the 1px border, left of the
+        # label's 6px text padding, away from the 7px corner radii -- the
+        # pure class background
+        img = chip.grab().toImage()
+        sample = img.pixelColor(4, img.height() // 2)
+        assert abs(sample.lightness() - QColor(bg).lightness()) <= 3, (
+            scheme_name, sample.name(), bg)
+
+        # Glyph pin, on the LABEL ALONE (grabbing the chip would mix in the
+        # (x) button, which carries the class fg through its own selector
+        # and would mask a broken label rule). The label's background is
+        # transparent, so any sufficiently-opaque pixel IS glyph; Qt hands
+        # out UN-premultiplied colors, so anti-aliasing only touches alpha,
+        # never the RGB a glyph pixel carries. The nearest opaque pixel to
+        # the class fg must sit closer than a fallback to the scheme's base
+        # text color ever could -- that margin is what actually pins the
+        # per-class rule (a lightness-only tolerance let the fallback pass
+        # in every scheme; found by review mutation experiment).
+        label = chip.findChild(QLabel, "tileTagName")
+        limg = label.grab().toImage()
+        glyph_px = [limg.pixelColor(x, y)
+                    for x in range(limg.width())
+                    for y in range(limg.height())
+                    if limg.pixelColor(x, y).alpha() > 64]
+        assert glyph_px, scheme_name  # the tag name must actually render
+        fg_c, text_c = QColor(fg), QColor(th.active()["text"])
+        nearest = min(cheb(px, fg_c) for px in glyph_px)
+        # any glyph pixel matches the class fg exactly-ish; the fallback
+        # color's own pixels would sit at >= cheb(fg, text) instead
+        assert nearest <= max(8, cheb(fg_c, text_c) - 8), (
+            scheme_name, nearest, fg, th.active()["text"])
+        # and the pen must still differ from the plate it sits on
+        assert abs(fg_c.lightness() - QColor(bg).lightness()) > 60, (
+            scheme_name, fg, bg)
+    finally:
+        th.set_active(was)
+
+
 def test_chips_cannot_raise_tile_minimum_without_bound(make_ws):
     """A long tag list must not inflate the header's -- and so the tile's
     and window's -- minimum width: the display is capped, not the model."""
@@ -1088,6 +1159,66 @@ def test_chips_cannot_raise_tile_minimum_without_bound(make_ws):
 
     assert three == nine              # the cap does not grow with the count
     assert nine < base + 160          # and stays well inside a tile's floor
+
+
+def test_chip_x_removes_only_that_tag(make_ws, qapp):
+    """A tag name leaves the pane ONLY by its explicit (x): this pane drops
+    the tag, the group's other holders keep it, and the recount says so."""
+    ws = make_ws(2)
+    ws.tiles[0].set_tags(["fe", "be"])
+    ws.tiles[1].set_tags(["fe"])
+
+    chip = ws.tiles[0].header._chips_layout.itemAt(0).widget()
+    x = chip.findChild(QToolButton, "tileTagX")
+    x.click()
+    qapp.processEvents()
+
+    assert ws.tiles[0].tags() == ["be"]
+    assert ws.tiles[1].tags() == ["fe"]  # other holders untouched
+    assert ws.tiles[0].header.chip_texts() == ["be"]
+    assert ws._count_label.text() == 'group "fe": 1 pane'
+
+    # the "+N" counter is not a tag: it carries no (x)
+    ws.tiles[0].set_tags(["a", "b", "c"])
+    counter = ws.tiles[0].header._chips_layout.itemAt(2).widget()
+    assert counter.findChild(QToolButton, "tileTagX") is None
+
+
+def test_chip_x_double_click_removes_only_one_tag(make_ws, qapp):
+    """The double-click's second press lands on whatever slid under the
+    stationary cursor after the rebuild -- the (x) must swallow it, or one
+    double-click wipes two tags (the second never aimed at)."""
+    from PySide6.QtCore import QEvent, QPointF
+    from PySide6.QtGui import QMouseEvent
+
+    def _dblclick(w):
+        center = QPointF(w.rect().center())
+        ev = QMouseEvent(QEvent.Type.MouseButtonDblClick,
+                         center, center, center,
+                         Qt.MouseButton.LeftButton,
+                         Qt.MouseButton.LeftButton,
+                         Qt.KeyboardModifier.NoModifier)
+        QApplication.sendEvent(w, ev)
+
+    ws = make_ws(1)
+    t = ws.tiles[0]
+    t.set_tags(["aaaa", "bbbb"])
+
+    x0 = t.header._chips_layout.itemAt(0).widget().findChild(
+        QToolButton, "tileTagX")
+    x0.click()  # first release of the double-click: "aaaa" leaves
+    qapp.processEvents()
+    assert t.tags() == ["bbbb"]
+
+    x1 = t.header._chips_layout.itemAt(0).widget().findChild(
+        QToolButton, "tileTagX")
+    _dblclick(x1)  # the second press, on the slid-in (x)
+    qapp.processEvents()
+    assert t.tags() == ["bbbb"]  # swallowed: not removed
+
+    x1.click()  # a deliberate fresh click still works
+    qapp.processEvents()
+    assert t.tags() == []
 
 
 def test_relaunch_clears_tags_tint_and_hints(make_ws, qapp):
@@ -1110,7 +1241,9 @@ def test_relaunch_clears_tags_tint_and_hints(make_ws, qapp):
 # --- sync tint (WHERE a keystroke will go) ----------------------------------------
 
 
-def test_sync_tint_marks_domain_only_when_tags_exist(make_ws, qapp):
+def test_sync_tint_marks_every_pane_when_unscoped(make_ws, qapp):
+    """The left-click arm's audience is everyone: every header lights, tag
+    groups and all. Scoping (see below) is what narrows the tint."""
     ws = make_ws(3)
     ws.tiles[0].set_tags(["a"])
     ws.tiles[1].set_tags(["a"])
@@ -1118,10 +1251,10 @@ def test_sync_tint_marks_domain_only_when_tags_exist(make_ws, qapp):
     ws._sync_btn.setChecked(True)
     _focus_pane(ws, 0, qapp)
 
-    assert _sync_states(ws) == ["source", "peer", ""]
+    assert _sync_states(ws) == ["source", "peer", "peer"]
 
-    _focus_pane(ws, 2, qapp)  # the b pane drives alone: it is its own group
-    assert _sync_states(ws) == ["", "", "source"]
+    _focus_pane(ws, 2, qapp)  # any pane drives the same everyone audience
+    assert _sync_states(ws) == ["peer", "peer", "source"]
 
     ws._sync_btn.setChecked(False)  # sync off: everything clears
     assert _sync_states(ws) == ["", "", ""]
@@ -1136,16 +1269,19 @@ def test_zero_tags_never_tint(make_ws, qapp):
     assert not any(_sync_states(ws))
 
 
-def test_lone_untagged_pane_shows_source_tint_only(make_ws, qapp):
-    """A lone untagged pane drives nobody, but its own source tint still
-    lights: 'you drive, and you are alone' beats looking disarmed."""
+def test_scoped_tint_marks_only_the_group(make_ws, qapp):
+    """A scoped arm narrows the tint to the chosen group; a pane outside it
+    (here: the untagged one) keeps its keyboard local and its header dark."""
     ws = make_ws(3)
     ws.tiles[0].set_tags(["a"])
     ws.tiles[1].set_tags(["a"])
-    ws._sync_btn.setChecked(True)
-    _focus_pane(ws, 2, qapp)
+    ws._apply_sync(True, "a", None)
+    _focus_pane(ws, 0, qapp)
 
-    assert _sync_states(ws) == ["", "", "source"]
+    assert _sync_states(ws) == ["source", "peer", ""]
+
+    _focus_pane(ws, 2, qapp)  # outside the armed group: nothing promised
+    assert _sync_states(ws) == ["", "", ""]
 
 
 def test_sync_tint_clears_on_focus_loss(make_ws, qapp):
@@ -1154,7 +1290,7 @@ def test_sync_tint_clears_on_focus_loss(make_ws, qapp):
     ws.tiles[1].set_tags(["a"])
     ws._sync_btn.setChecked(True)
     _focus_pane(ws, 0, qapp)
-    assert _sync_states(ws) == ["source", "peer", ""]
+    assert _sync_states(ws) == ["source", "peer", "peer"]
 
     ws._broadcast_input.setFocus()  # keyboard left the panes
     qapp.processEvents()
@@ -1162,13 +1298,13 @@ def test_sync_tint_clears_on_focus_loss(make_ws, qapp):
     assert not any(_sync_states(ws))
 
 
-def test_sync_tint_updates_when_tags_change_while_armed(make_ws, qapp):
+def test_scoped_tint_updates_when_tags_change_while_armed(make_ws, qapp):
     """Untagging a pane mid-sync must unlight it in the same instant its
     keys stop flowing -- the tint may never disagree with delivery."""
     ws = make_ws(3)
     ws.tiles[0].set_tags(["a"])
     ws.tiles[1].set_tags(["a"])
-    ws._sync_btn.setChecked(True)
+    ws._apply_sync(True, "a", None)
     _focus_pane(ws, 0, qapp)
     assert _sync_states(ws) == ["source", "peer", ""]
 
@@ -1198,7 +1334,7 @@ def test_sync_tint_clears_when_peer_dies_mid_sync(make_ws, qapp):
     assert dead.injected == []
 
 
-def test_sync_toggle_flash_names_the_focused_group(make_ws, qapp):
+def test_sync_toggle_flash_names_the_audience(make_ws, qapp):
     ws = make_ws(3)
     ws.tiles[0].set_tags(["a"])
     ws.tiles[1].set_tags(["a"])
@@ -1206,15 +1342,658 @@ def test_sync_toggle_flash_names_the_focused_group(make_ws, qapp):
 
     ws._sync_btn.setChecked(True)
 
-    assert ws._count_label.text() == "sync input on · @a (1 pane)"
+    assert ws._count_label.text() == "sync input on · all (2 panes)"
 
-    _focus_pane(ws, 2, qapp)  # untagged focused: the group has a name too
-    ws._sync_btn.setChecked(False)
-    ws._sync_btn.setChecked(True)
-    assert ws._count_label.text() == "sync input on · untagged (0 panes)"
+    ws._pick_sync_scope("a")  # the menu's narrower choice names its group
+    assert ws._count_label.text() == "sync input on · @a (1 pane)"
 
     ws.tiles[0].set_tags([])  # zero tags again: today's exact string
     ws.tiles[1].set_tags([])
     ws._sync_btn.setChecked(False)
     ws._sync_btn.setChecked(True)
     assert ws._count_label.text() == "sync input on"
+
+
+# --- sync input scoping (the right-click tag menu) --------------------------------
+
+
+def test_right_click_menu_lists_every_known_tag(make_ws, qapp):
+    """The menu's vocabulary is the whole workspace's, not the focused
+    pane's: any group is one right-click away from any pane."""
+    ws = make_ws(4)
+    for tile, t in zip(ws.tiles, "abcd"):
+        tile.set_tags([t])
+    ws.tiles[1].set_tags(["b", "extra"])
+    _focus_pane(ws, 1, qapp)
+
+    menu = ws._build_sync_menu(ws.tiles[1])
+    texts = [ac.text() for ac in menu.actions()]
+    for tag in ("a", "b", "c", "d", "extra"):
+        assert tag in texts
+    assert "All windows" in texts
+    assert "Turn mirroring off" not in texts  # unarmed: no off entry
+
+
+def test_right_click_menu_without_tags_offers_all_and_a_hint(make_ws, qapp):
+    ws = make_ws(2)
+
+    menu = ws._build_sync_menu(None)
+    acts = {ac.text(): ac for ac in menu.actions()}
+
+    assert acts["All windows"].isEnabled()
+    hint = next(ac for ac in menu.actions() if ac.text().startswith("No tags"))
+    assert not hint.isEnabled()
+
+
+def test_left_click_arms_all_windows_even_for_multi_tag_panes(
+        make_ws, qapp, monkeypatch):
+    """No more picker detour: a pane in several groups arms the everyone
+    audience on the first click, exactly like every other pane."""
+    ws = make_ws(3)
+    ws.tiles[1].set_tags(["a", "b"])
+    _focus_pane(ws, 1, qapp)
+    opened = []
+    monkeypatch.setattr(ws, "_on_sync_menu", lambda pos: opened.append(pos))
+
+    ws._sync_btn.setChecked(True)  # the click's toggled path
+    assert ws._sync_btn.isChecked()
+    assert not opened              # no menu jumped out
+    assert ws._sync_keys and ws._sync_scope is None
+
+
+def test_menu_picking_a_tag_drives_only_that_group(make_ws, qapp):
+    """The request's example, verbatim: a {1,2} pane can drive group 1 OR
+    group 2 -- the unpicked group and everyone else stay untouched."""
+    ws = make_ws(4)
+    ws.tiles[0].set_tags(["1"])
+    ws.tiles[1].set_tags(["1", "2"])   # the multi-tag driver
+    ws.tiles[2].set_tags(["2"])
+    _focus_pane(ws, 1, qapp)
+
+    menu = ws._build_sync_menu(ws.tiles[1])
+    next(ac for ac in menu.actions() if ac.text() == "2").toggle()
+
+    assert ws._sync_btn.isChecked()
+    assert ws._sync_scope == "2"
+    assert ws._sync_btn.text() == "⇉  Sync · @2"
+    assert ws._count_label.text() == "sync input on · @2 (1 pane)"
+
+    ws.tiles[1].terminal.inputSent.emit("x", False)
+    assert ws.tiles[2].terminal.injected == [("x", False)]  # group 2 got it
+    assert ws.tiles[0].terminal.injected == []              # group 1 did not
+    assert ws.tiles[3].terminal.injected == []              # untagged neither
+
+
+def test_menu_all_windows_entry_arms_the_everyone_audience(make_ws, qapp):
+    """The menu's own way back to the left-click audience (and out of a
+    scoped arm) without an off/on blip."""
+    ws = make_ws(3)
+    ws.tiles[0].set_tags(["1"])
+    ws.tiles[1].set_tags(["1"])
+    ws._apply_sync(True, "1", None)
+
+    menu = ws._build_sync_menu(ws.tiles[0])
+    acts = {ac.text(): ac for ac in menu.actions()}
+    assert acts["1"].isChecked() and not acts["All windows"].isChecked()
+    acts["All windows"].toggle()
+
+    assert ws._sync_btn.isChecked()
+    assert ws._sync_scope is None
+    assert ws._sync_btn.text() == "⇉  Sync · all"
+
+    ws.tiles[0].terminal.inputSent.emit("y", False)
+    assert ws.tiles[1].terminal.injected == [("y", False)]
+    assert ws.tiles[2].terminal.injected == [("y", False)]  # untagged too
+
+
+def test_scoped_sync_switches_group_in_one_click(make_ws, qapp):
+    ws = make_ws(4)
+    ws.tiles[0].set_tags(["1"])
+    ws.tiles[1].set_tags(["1", "2"])
+    ws.tiles[2].set_tags(["2"])
+    _focus_pane(ws, 1, qapp)
+    ws._apply_sync(True, "2", None)
+
+    menu = ws._build_sync_menu(ws.tiles[1])
+    acts = {ac.text(): ac for ac in menu.actions()}
+    assert "Turn mirroring off" in acts          # armed: the off way back
+    assert acts["2"].isChecked() and not acts["1"].isChecked()
+    acts["1"].toggle()
+
+    assert ws._sync_btn.isChecked()              # no off/on blip
+    assert ws._sync_scope == "1"
+    assert ws._sync_btn.text() == "⇉  Sync · @1"
+
+    ws.tiles[1].terminal.inputSent.emit("y", False)
+    assert ws.tiles[0].terminal.injected == [("y", False)]
+    assert ws.tiles[2].terminal.injected == []   # group 2 no longer driven
+
+
+def test_scoped_sync_off_entry_disarms(make_ws, qapp):
+    ws = make_ws(3)
+    ws.tiles[0].set_tags(["1", "2"])
+    _focus_pane(ws, 0, qapp)
+    ws._apply_sync(True, "2", None)
+
+    menu = ws._build_sync_menu(ws.tiles[0])
+    next(ac for ac in menu.actions()
+         if ac.text() == "Turn mirroring off").trigger()
+
+    assert not ws._sync_btn.isChecked()
+    assert ws._sync_scope is None
+    assert ws._sync_btn.text() == "⇉  Sync input"
+    assert ws._count_label.text() == "sync input off"
+
+
+def test_armed_zero_tag_workspace_keeps_the_plain_button_label(make_ws, qapp):
+    """The zero-tag pixel-parity invariant, button-label edition: armed with
+    no tags anywhere the button must read exactly "⇉  Sync input" -- and the
+    "Sync · all" era must end the moment the last tag leaves, by untag OR by
+    closing the pane (a close fires no tagsChanged; _rebuild covers it)."""
+    ws = make_ws(2)
+    ws._sync_btn.setChecked(True)
+    assert ws._sync_btn.text() == "⇉  Sync input"   # armed, zero tags: plain
+
+    ws.tiles[0].set_tags(["a"])                     # a tag arrives while armed
+    assert ws._sync_btn.text() == "⇉  Sync · all"
+
+    ws.tiles[0].set_tags([])                        # ...and leaves by untag
+    assert ws._sync_btn.text() == "⇉  Sync input"
+
+    ws.tiles[0].set_tags(["a"])
+    ws._on_close_tile(0)                            # ...or by closing the pane
+    assert ws._sync_btn.text() == "⇉  Sync input"
+
+
+def test_menu_reclick_of_a_checked_entry_is_a_dismissal(make_ws, qapp):
+    """Unchecking the already-checked audience (the user re-clicking the
+    checkmark) must be a no-look dismissal -- never an arm change."""
+    ws = make_ws(2)
+    ws.tiles[0].set_tags(["1"])
+    ws._apply_sync(True, "1", None)
+
+    menu = ws._build_sync_menu(ws.tiles[0])
+    next(ac for ac in menu.actions() if ac.text() == "1").toggle()
+    assert ws._sync_keys and ws._sync_scope == "1"  # scoped arm untouched
+
+    ws._apply_sync(True, None, None)                # same contract for "all"
+    menu = ws._build_sync_menu(ws.tiles[0])
+    next(ac for ac in menu.actions()
+         if ac.text() == "All windows").toggle()
+    assert ws._sync_keys and ws._sync_scope is None
+
+
+def test_scoped_sync_label_elides_long_tags(make_ws, qapp):
+    """A 16-char tag must not grow the button's (and so the toolbar's)
+    minimum: the tag elides to a fixed pixel budget, short tags verbatim."""
+    ws = make_ws(2)
+    ws.tiles[0].set_tags(["short", "averyverylongtag"])
+    _focus_pane(ws, 0, qapp)
+
+    ws._pick_sync_scope("short", ws.tiles[0])
+    assert ws._sync_btn.text() == "⇉  Sync · @short"
+
+    ws._pick_sync_scope("averyverylongtag", ws.tiles[0])
+    text = ws._sync_btn.text()
+    assert text.startswith("⇉  Sync · @aver")  # elide keeps a readable prefix
+    assert text.endswith("…") and len(text) < len("⇉  Sync · @averyverylongtag")
+
+
+def test_scoped_sync_source_outside_the_group_stays_local(make_ws, qapp):
+    """Armed for one group, typing on a pane OUTSIDE it mirrors nowhere:
+    the mirror is a property of the group, not of the keyboard. The tint
+    must make exactly the same promise as the fan-out."""
+    ws = make_ws(4)
+    ws.tiles[0].set_tags(["1"])
+    ws.tiles[1].set_tags(["1", "2"])
+    ws.tiles[2].set_tags(["2"])
+    _focus_pane(ws, 1, qapp)
+    ws._apply_sync(True, "2", None)
+
+    ws.tiles[0].terminal.inputSent.emit("x", False)  # tag {1}: not in group 2
+    assert all(t.terminal.injected == [] for t in ws.tiles)
+
+    _focus_pane(ws, 0, qapp)
+    assert not any(_sync_states(ws))  # the tint promises nothing either
+    _focus_pane(ws, 1, qapp)
+    assert _sync_states(ws) == ["", "source", "peer", ""]
+
+
+def test_scoped_arm_skips_dead_and_untagged_targets(make_ws):
+    ws = make_ws(4)
+    ws.tiles[0].set_tags(["1", "2"])
+    ws.tiles[1].set_tags(["2"])
+    ws.tiles[2].set_tags(["2"])
+    ws.tiles[2].terminal.is_dead = lambda: True
+    ws._apply_sync(True, "2", None)
+
+    ws.tiles[0].terminal.inputSent.emit("k", False)
+    assert ws.tiles[1].terminal.injected == [("k", False)]
+    assert ws.tiles[2].terminal.injected == []  # dead target
+    assert ws.tiles[3].terminal.injected == []  # untagged
+
+
+def test_scope_tag_dropped_everywhere_mirrors_nowhere(make_ws, qapp):
+    """Every holder of the armed tag drops it: the group is gone. The arm
+    stays (the user set it) but nothing receives -- honestly and visibly,
+    with no silent semantic fallback."""
+    ws = make_ws(3)
+    ws.tiles[0].set_tags(["1", "2"])
+    ws.tiles[1].set_tags(["2"])
+    ws._apply_sync(True, "2", None)
+
+    ws.tiles[1].set_tags([])
+    ws.tiles[0].set_tags(["1"])  # the last holder leaves group 2
+    assert "2" not in ws._known_tags()
+
+    ws.tiles[0].terminal.inputSent.emit("x", False)
+    assert all(t.terminal.injected == [] for t in ws.tiles)
+    _focus_pane(ws, 0, qapp)
+    assert not any(_sync_states(ws))
+
+
+# --- cross-window linking (two workspaces + two real buses, one process) --------
+
+import uuid  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+from megacode import sync_protocol as link_proto  # noqa: E402
+from megacode.sync_bus import SyncBus  # noqa: E402
+
+
+def _spin(cond, ms=3000):
+    app = QApplication.instance()
+    deadline = __import__("time").monotonic() + ms / 1000.0
+    while __import__("time").monotonic() < deadline:
+        if cond():
+            return True
+        app.processEvents()
+        __import__("time").sleep(0.002)
+    return cond()
+
+
+@pytest.fixture()
+def linked_pair(make_ws, qapp, tmp_path, monkeypatch):
+    """Two workspaces, each on its own REAL SyncBus, linked over a pipe."""
+    state = tmp_path / f"link{uuid.uuid4().hex[:8]}"
+    state.mkdir()
+    suffix = f"-wt{uuid.uuid4().hex[:8]}"
+    buses = []
+
+    def _make(n):
+        bus = SyncBus(state, name_suffix=suffix, jitter_fn=lambda: 0,
+                      hello_timeout_ms=500, ping_ms=40, backoff=[5, 10, 20, 40])
+        buses.append(bus)
+        ws = make_ws(n)
+        ws.set_link(bus)
+        return ws
+
+    a = _make(2)
+    b = _make(2)
+    assert _spin(lambda: a._link.is_alive() and b._link.is_alive())
+    yield a, b
+    for bus in buses:
+        try:
+            bus.stop()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def test_peerless_real_bus_keeps_workspace_byte_identical(make_ws, qapp, tmp_path):
+    """A started-but-alone bus must not leak any UI: the chip stays hidden,
+    the hints keep the base constants, typing stays local."""
+    ws = make_ws(2)
+    bus = SyncBus(tmp_path, name_suffix=f"-wt{uuid.uuid4().hex[:8]}",
+                  jitter_fn=lambda: 0)
+    ws.set_link(bus)
+    assert _spin(lambda: bus._role == "hub")
+
+    assert not ws._link_btn.isVisible()
+    assert ws._broadcast_input.placeholderText() == wsm._BROADCAST_PLACEHOLDER_BASE
+    assert ws._sync_btn.toolTip() == wsm._SYNC_TIP_BASE
+
+    ws._sync_btn.setChecked(True)
+    ws.tiles[0].terminal.inputSent.emit("d", False)
+    assert ws.tiles[1].terminal.injected == [("d", False)]  # local mirror intact
+    bus.stop()
+
+
+def test_remote_input_reaches_all_remote_panes_when_unscoped(linked_pair):
+    """The left-click arm crosses the wire as "all": every live pane in the
+    other window receives, tag groups be damned."""
+    a, b = linked_pair
+    a.tiles[0].set_tags(["fe"])
+    b.tiles[0].set_tags(["fe"])
+    b.tiles[1].set_tags(["be"])
+    assert _spin(lambda: "fe" in a._link.registry().known_tags()
+                  and "fe" in b._link.registry().known_tags())
+
+    a._sync_btn.setChecked(True)  # ONE global state replicates to b
+    assert _spin(lambda: b._sync_btn.isChecked())
+
+    a.tiles[0].terminal.inputSent.emit("x", False)
+    assert _spin(lambda: b.tiles[0].terminal.injected == [("x", False)]
+                 and b.tiles[1].terminal.injected == [("x", False)])
+    assert a.tiles[1].terminal.injected == [("x", False)]  # local all-arm too
+
+
+def test_remote_input_scopes_to_the_tag_over_the_wire(linked_pair):
+    a, b = linked_pair
+    a.tiles[0].set_tags(["fe"])
+    b.tiles[0].set_tags(["fe"])
+    b.tiles[1].set_tags(["be"])
+    assert _spin(lambda: "fe" in a._link.registry().known_tags()
+                  and "fe" in b._link.registry().known_tags())
+
+    a._pick_sync_scope("fe")
+    assert _spin(lambda: b._sync_btn.isChecked() and b._sync_scope == "fe")
+
+    a.tiles[0].terminal.inputSent.emit("x", False)
+    assert _spin(lambda: b.tiles[0].terminal.injected == [("x", False)])
+    assert b.tiles[1].terminal.injected == []       # other tag: never crossed
+    assert a.tiles[1].terminal.injected == []       # untagged local: not in @fe
+
+
+def test_injected_remote_input_never_republishes(linked_pair):
+    """The echo-loop pin, end to end: remote delivery must not re-emit
+    inputSent, so nothing bounces back."""
+    a, b = linked_pair
+    a.tiles[0].set_tags(["fe"])
+    b.tiles[0].set_tags(["fe"])
+    assert _spin(lambda: "fe" in b._link.registry().known_tags())
+    a._sync_btn.setChecked(True)
+    assert _spin(lambda: b._sync_btn.isChecked())
+
+    a.tiles[0].terminal.inputSent.emit("x", False)
+    assert _spin(lambda: b.tiles[0].terminal.injected == [("x", False)])
+
+    # inject_input (the fake mirrors the real contract) never re-emits;
+    # b's panes got exactly ONE delivery each and nothing travelled back
+    assert a.tiles[0].terminal.injected == []
+    assert all(t.injected == [("x", False)] for t in
+               (b.tiles[0].terminal, b.tiles[1].terminal))
+
+
+def test_sync_toggle_replicates_with_set_in_flash(linked_pair):
+    a, b = linked_pair
+    a._sync_btn.setChecked(True)
+    assert _spin(lambda: b._sync_btn.isChecked())
+    assert "set in W1" in b._count_label.text()
+    # one click == one state: turning it off propagates too
+    a._sync_btn.setChecked(False)
+    assert _spin(lambda: not b._sync_btn.isChecked())
+
+
+def test_all_arm_flash_splits_the_remote_audience(linked_pair):
+    """The left-click flash names the everyone audience on both sides of
+    the pipe (alive_pane_count drives the remote half)."""
+    a, b = linked_pair
+    a.tiles[0].set_tags(["fe"])
+    b.tiles[0].set_tags(["fe"])
+    assert _spin(lambda: "fe" in a._link.registry().known_tags())
+    # b was shown after a: offscreen keeps the LAST window active, and
+    # QApplication.focusWidget() follows the active window -- so put a
+    # back on top before focusing its pane
+    a.raise_()
+    a.activateWindow()
+    _focus_pane(a, 0, QApplication.instance())
+
+    a._sync_btn.setChecked(True)
+
+    # a holds 2 panes (the focused one is the source), b holds 2 alive
+    assert a._count_label.text() == \
+        "sync input on · all windows (1 here · 2 in 1 window)"
+
+
+def test_sync_menu_includes_remote_only_tags(linked_pair):
+    """The right-click vocabulary spans windows: a tag held only by the
+    other window's panes is still offered for scoping."""
+    a, b = linked_pair
+    b.tiles[0].set_tags(["far"])
+    assert _spin(lambda: "far" in a._known_tags())
+
+    texts = [ac.text() for ac in a._build_sync_menu(None).actions()]
+    assert "far" in texts
+    assert "All windows" in texts
+
+
+def test_unscoped_rearm_over_the_wire_clears_a_remote_scope(linked_pair):
+    """The menu's "All windows" re-arm (no off/on blip) must clear a scope
+    another window adopted -- ONE global state, everywhere, at once."""
+    a, b = linked_pair
+    a.tiles[0].set_tags(["fe"])
+    b.tiles[0].set_tags(["fe"])
+    b.tiles[1].set_tags(["be"])
+    assert _spin(lambda: {"fe", "be"} <= set(a._known_tags()))
+
+    a._pick_sync_scope("fe")
+    assert _spin(lambda: b._sync_scope == "fe")
+
+    a._arm_sync(True, None)  # the "All windows" entry's path
+    assert _spin(lambda: b._sync_btn.isChecked() and b._sync_scope is None)
+    assert b._sync_btn.text() == "⇉  Sync · all"
+
+    a.tiles[0].terminal.inputSent.emit("z", False)
+    assert _spin(lambda: b.tiles[1].terminal.injected == [("z", False)])  # @be too
+
+
+def test_scoped_run_all_spans_windows_and_flashes_split(linked_pair):
+    a, b = linked_pair
+    a.tiles[0].set_tags(["fe"])
+    b.tiles[1].set_tags(["fe"])
+    # wait for the CROSS-window vocabularies specifically: the local tag
+    # satisfies _known_tags instantly and says nothing about the wire
+    assert _spin(lambda: "fe" in a._link.registry().known_tags()
+                 and "fe" in b._link.registry().known_tags())
+
+    a._broadcast_input.setText("@fe git pull")
+    a._broadcast()
+    assert _spin(lambda: b.tiles[1].terminal.commands == ["git pull\r"])
+    assert a.tiles[0].terminal.commands == ["git pull\r"]  # local side ran too
+    assert "1 pane here · 1 in 1 window · @fe" in a._count_label.text()
+    assert _spin(lambda: "(from W1)" in b._count_label.text())
+
+
+def test_plain_run_all_and_run_pasted_never_hit_the_wire(linked_pair):
+    a, b = linked_pair
+    a.tiles[0].set_tags(["fe"])
+    b.tiles[0].set_tags(["fe"])
+    assert _spin(lambda: "fe" in a._known_tags())
+
+    a._broadcast_input.setText("dir")
+    a._broadcast()
+    assert a.tiles[0].terminal.commands == ["dir\r"]
+    assert _spin(lambda: True)
+    assert b.tiles[0].terminal.commands == []          # never crossed
+
+    b.tiles[0].terminal.set_pending(True)
+    a._execute_pasted()
+    assert b.tiles[0].terminal.has_pending_input()      # still waiting
+
+
+def test_remote_only_tag_scopes_run_all(linked_pair):
+    """A tag that exists ONLY in the other window still scopes the run --
+    and must not trip the 'no live pane' warning."""
+    a, b = linked_pair
+    b.tiles[0].set_tags(["remote1"])
+    assert _spin(lambda: "remote1" in a._known_tags())
+
+    a._broadcast_input.setText("@remote1 cmd")
+    a._broadcast()
+    assert _spin(lambda: b.tiles[0].terminal.commands == ["cmd\r"])
+    assert all(t.terminal.commands == [] for t in a.tiles)
+    assert "no live pane" not in a._count_label.text()
+
+
+def test_remote_tags_join_vocabulary_and_menu_then_leave(linked_pair):
+    a, b = linked_pair
+    b.tiles[0].set_tags(["shared"])
+    assert _spin(lambda: "shared" in a._known_tags())
+    menu = a._build_tile_menu(a.tiles[0])
+    assert any(ac.text() == "shared" for ac in menu.actions())
+
+    b.tiles[0].set_tags([])
+    assert _spin(lambda: "shared" not in a._known_tags())
+
+
+def test_chip_and_title_follow_the_link(linked_pair):
+    a, b = linked_pair
+    assert _spin(lambda: a._link_btn.isVisible() and b._link_btn.isVisible())
+    assert a._link_btn.text() == "⛓  2 windows"
+
+    titles = []
+    a.linkedInfoChanged.connect(titles.append)
+    b._link.stop()
+    assert _spin(lambda: not a._link_btn.isVisible())  # back to solo: hidden
+    a._link.start()
+    assert _spin(lambda: a._link.is_alive())
+    assert not a._link_btn.isVisible()  # healthy solo stays hidden
+    a._link.stop()
+
+
+def test_kill_switch_isolates_both_directions(linked_pair):
+    a, b = linked_pair
+    assert _spin(lambda: a._link_btn.isVisible())
+
+    b._link_btn.setChecked(False)  # the session kill switch
+    # the leaver dies; the survivor (hub) stays alive but alone
+    assert _spin(lambda: not b._link.is_alive()
+                 and a._link.registry().other_windows() == 0)
+    assert _spin(lambda: not a._link_btn.isVisible())
+    assert b._count_label.text() == "window linking off"
+
+    # re-linking is one click
+    b._link_btn.setChecked(True)
+    assert _spin(lambda: a._link.is_alive() and b._link.is_alive())
+
+
+def test_relaunch_publishes_empty_digest(linked_pair):
+    a, b = linked_pair
+    a.tiles[0].set_tags(["fe"])
+    assert _spin(lambda: "fe" in b._known_tags())
+
+    a.start(2, "fake", os.getcwd(), font_size=10, label="term")
+    assert _spin(lambda: "fe" not in b._known_tags())  # empty digest traveled
+
+
+def test_relink_revives_the_cross_window_vocabulary(linked_pair):
+    """kill-switch -> re-link must re-announce the panes (the hello carries
+    the cached digest; the workspace publishes on tile events only, so a
+    stop() that threw the table away would leave this window pane-less in
+    its peers' registries -- sync would silently stop crossing)."""
+    a, b = linked_pair
+    b.tiles[0].set_tags(["fe"])
+    assert _spin(lambda: "fe" in a._link.registry().known_tags())
+
+    b._link_btn.setChecked(False)  # session kill switch
+    assert _spin(lambda: not b._link.is_alive()
+                 and a._link.registry().other_windows() == 0)
+
+    b._link_btn.setChecked(True)   # one click back
+    assert _spin(lambda: b._link.is_alive())
+    assert _spin(lambda: "fe" in a._link.registry().known_tags())
+
+
+def test_tag_cap_matches_the_wire_budget(make_ws):
+    """The wire digest carries at most MAX_TAGS_PER_PANE tags per pane; the
+    tile model caps at the same budget so in-window mirroring and the
+    cross-window digest can never disagree about a pane's groups."""
+    from megacode import sync_protocol as lp
+
+    ws = make_ws(1)
+    tile = ws.tiles[0]
+    tile.set_tags([f"t{i}" for i in range(lp.MAX_TAGS_PER_PANE + 4)])
+    assert len(tile.tags()) == lp.MAX_TAGS_PER_PANE
+    assert tile.tags() == [f"t{i}" for i in range(lp.MAX_TAGS_PER_PANE)]
+    # the digest row survives (build_pane_entry no longer sees an over-budget pane)
+    assert ws._pane_digest()[0]["tags"] == tile.tags()
+
+
+def test_remote_pulse_marks_receiving_panes(linked_pair, qapp):
+    a, b = linked_pair
+    a.tiles[0].set_tags(["fe"])
+    b.tiles[0].set_tags(["fe"])
+    assert _spin(lambda: "fe" in b._known_tags())
+    a._sync_btn.setChecked(True)
+    assert _spin(lambda: b._sync_btn.isChecked())
+
+    # Production shape: the user types in the SENDING window, so the
+    # receiver's headers are tint-free and the pulse is visible. (Both
+    # workspaces share one QApplication here, and offscreen keeps focus in
+    # the last-shown window: without activateWindow() focus idles on b's
+    # pane, which lights it as a sync SOURCE, and the pulse correctly
+    # yields to that tint.)
+    a.window().activateWindow()
+    _focus_pane(a, 0, qapp)
+    assert a.tiles[0].header.property("sync") == "source"
+    assert not any(_sync_states(b))
+
+    a.tiles[0].terminal.inputSent.emit("x", False)
+    assert _spin(lambda: b.tiles[0].header.property("remotePulse") == "true")
+    assert _spin(lambda: b.tiles[0].header.property("remotePulse") != "true",
+                 ms=2500)  # the pulse decays
+
+
+def test_oversize_paste_skips_the_wire_with_flash(linked_pair):
+    a, b = linked_pair
+    a.tiles[0].set_tags(["fe"])
+    b.tiles[0].set_tags(["fe"])
+    assert _spin(lambda: "fe" in b._known_tags())
+    a._sync_btn.setChecked(True)
+    assert _spin(lambda: b._sync_btn.isChecked())
+
+    a.tiles[0].terminal.inputSent.emit(
+        "x" * (link_proto.MAX_SEQ + 1), True)
+    assert a._count_label.text() == "paste too large to mirror across windows"
+    assert _spin(lambda: True)
+
+
+def test_scoped_sync_replicates_and_re_scopes_across_windows(linked_pair):
+    """The picked group is ONE global truth: it replicates with the toggle,
+    drives only its group's panes in every window, and a live re-scope
+    switches the group everywhere without an off/on blip."""
+    a, b = linked_pair
+    a.tiles[0].set_tags(["fe", "be"])
+    b.tiles[0].set_tags(["fe"])
+    b.tiles[1].set_tags(["be"])
+    assert _spin(lambda: {"fe", "be"} <= set(a._known_tags()))
+
+    a._pick_sync_scope("fe")
+    assert _spin(lambda: b._sync_btn.isChecked() and b._sync_scope == "fe")
+    assert "set in W1" in b._count_label.text()
+    assert b._sync_btn.text() == "⇉  Sync · @fe"
+
+    a.tiles[0].terminal.inputSent.emit("x", False)
+    assert _spin(lambda: b.tiles[0].terminal.injected == [("x", False)])
+    assert b.tiles[1].terminal.injected == []  # @be pane: the other group
+    assert a.tiles[1].terminal.injected == []  # untagged local pane
+
+    a._pick_sync_scope("be")
+    assert _spin(lambda: b._sync_scope == "be")
+    a.tiles[0].terminal.inputSent.emit("y", False)
+    assert _spin(lambda: b.tiles[1].terminal.injected == [("y", False)])
+    assert b.tiles[0].terminal.injected == [("x", False)]  # fe era, no more
+
+
+# --- theme menu (color-scheme switching) --------------------------------------
+
+def test_theme_menu_lists_every_scheme_and_emits_its_name(make_ws):
+    ws = make_ws(1)
+    from megacode import themes
+    assert set(ws._theme_actions) == set(themes.SCHEMES)
+    seen = []
+    ws.themeChanged.connect(seen.append)
+    ws._theme_actions["marine-night"].trigger()
+    assert seen == ["marine-night"]
+
+
+def test_apply_theme_refreshes_terminal_panes(make_ws, monkeypatch):
+    """Existing panes re-resolve their colors when the scheme changes; chat
+    tiles are QSS-only and must be left alone by the pane pass."""
+    ws = make_ws(2)
+    refreshed = []
+    monkeypatch.setattr(
+        wsm.TerminalWidget, "refresh_theme",
+        lambda self: refreshed.append(self), raising=False)
+    ws.apply_theme()
+    assert refreshed == [t.terminal for t in ws.tiles]

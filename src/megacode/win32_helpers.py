@@ -89,6 +89,15 @@ kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
 kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 kernel32.CloseHandle.restype = wintypes.BOOL
 
+kernel32.ProcessIdToSessionId.argtypes = [wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+kernel32.ProcessIdToSessionId.restype = wintypes.BOOL
+
+kernel32.GetCurrentProcessId.argtypes = []
+kernel32.GetCurrentProcessId.restype = wintypes.DWORD
+
+kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+
 
 # --- process helpers --------------------------------------------------------
 def get_process_path(pid: int) -> Optional[str]:
@@ -188,3 +197,197 @@ def move_window(hwnd: int, rect: Rect) -> None:
 def close_window(hwnd: int) -> None:
     """Politely ask ``hwnd`` to close (used by the self-test cleanup)."""
     user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+
+
+def is_pid_alive(pid: int) -> bool:
+    """True when ``pid`` names a live process.
+
+    Used by the sync link's election: a QLockFile whose holder died is safe
+    to take over (removeStaleLockFile), a live one never is -- correctness
+    over availability. OpenProcess failing for a same-user pid means the
+    process is gone; GetExitCodeProcess still reporting STILL_ACTIVE (259)
+    is the classic zombie check.
+    """
+    if pid <= 0:
+        return False
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return False
+    try:
+        code = wintypes.DWORD(0)
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return False
+        return code.value == 259  # STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def process_session_id() -> str:
+    """This process's Terminal Services session id (fast user switching and
+    RDP give one user several sessions; the sync link must not cross them)."""
+    sid = wintypes.DWORD(0)
+    if kernel32.ProcessIdToSessionId(kernel32.GetCurrentProcessId(), ctypes.byref(sid)):
+        return str(sid.value)
+    return "0"
+
+
+def is_process_elevated() -> bool:
+    """True when running elevated (Administrator).
+
+    The sync link refuses to start elevated unless the user forces it:
+    named pipes don't respect UIPI, so a normal-integrity instance's keys
+    could otherwise drive an elevated instance's shells.
+    """
+    class TOKEN_ELEVATION(ctypes.Structure):
+        _fields_ = [("TokenIsElevated", wintypes.DWORD)]
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    advapi32.OpenProcessToken.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE),
+    ]
+    advapi32.OpenProcessToken.restype = wintypes.BOOL
+    advapi32.GetTokenInformation.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    advapi32.GetTokenInformation.restype = wintypes.BOOL
+
+    kernel32.GetCurrentProcess.argtypes = []
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+
+    TOKEN_QUERY = 0x0008
+    TokenElevation = 20
+    handle = wintypes.HANDLE()
+    if not advapi32.OpenProcessToken(
+            kernel32.GetCurrentProcess(), TOKEN_QUERY, ctypes.byref(handle)):
+        return False
+    try:
+        elev = TOKEN_ELEVATION()
+        size = wintypes.DWORD(0)
+        ok = advapi32.GetTokenInformation(
+            handle, TokenElevation, ctypes.byref(elev),
+            ctypes.sizeof(elev), ctypes.byref(size),
+        )
+        return bool(ok and elev.TokenIsElevated)
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def harden_user_only(path: str) -> bool:
+    """Best-effort DACL: the file's owner + SYSTEM, full control only.
+
+    Applies to the sync link's secret/settings files. The user-profile
+    directory ACL is the primary boundary; this explicit ACE list is
+    defense in depth. Failure is non-fatal (some filesystems, e.g. network
+    redirection, reject SetNamedSecurityInfo) -- callers log and move on.
+    """
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    advapi32.GetNamedSecurityInfoW.argtypes = [
+        wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD,
+        ctypes.POINTER(wintypes.LPVOID), ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.LPVOID), ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.LPVOID),
+    ]
+    advapi32.GetNamedSecurityInfoW.restype = wintypes.DWORD
+    advapi32.SetNamedSecurityInfoW.argtypes = [
+        wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD,
+        wintypes.LPVOID, wintypes.LPVOID, wintypes.LPVOID, wintypes.LPVOID,
+    ]
+    advapi32.SetNamedSecurityInfoW.restype = wintypes.DWORD
+    advapi32.AllocateAndInitializeSid.argtypes = [
+        ctypes.POINTER(ctypes.c_ubyte * 6), wintypes.BYTE,
+        wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
+        wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
+        ctypes.POINTER(wintypes.LPVOID),
+    ]
+    advapi32.AllocateAndInitializeSid.restype = wintypes.BOOL
+    advapi32.GetLengthSid.argtypes = [wintypes.LPVOID]
+    advapi32.GetLengthSid.restype = wintypes.DWORD
+    advapi32.CopySid.argtypes = [
+        wintypes.DWORD, wintypes.LPVOID, wintypes.LPVOID,
+    ]
+    advapi32.CopySid.restype = wintypes.BOOL
+    advapi32.FreeSid.argtypes = [wintypes.LPVOID]
+    advapi32.FreeSid.restype = wintypes.LPVOID
+    advapi32.InitializeAcl.argtypes = [
+        wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD,
+    ]
+    advapi32.InitializeAcl.restype = wintypes.BOOL
+    advapi32.AddAccessAllowedAceEx.argtypes = [
+        wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
+        wintypes.LPVOID,
+    ]
+    advapi32.AddAccessAllowedAceEx.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [wintypes.HANDLE]
+    kernel32.LocalFree.restype = wintypes.HANDLE
+
+    SE_FILE_OBJECT = 1
+    OWNER_SECURITY_INFORMATION = 1
+    DACL_SECURITY_INFORMATION = 4
+    PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
+    ACL_REVISION = 2
+    FILE_ALL_ACCESS = 0x1F01FF
+    ERROR_SUCCESS = 0
+    NT_AUTHORITY = (ctypes.c_ubyte * 6)(0, 0, 0, 0, 0, 5)
+    LOCAL_SYSTEM_RID = 18
+
+    # the file's current owner SID (GetNamedSecurityInfo hands us buffers
+    # it allocated: copy the SID out, free the descriptor)
+    psid_owner = wintypes.LPVOID()
+    psd = wintypes.LPVOID()
+    if advapi32.GetNamedSecurityInfoW(
+            path, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
+            ctypes.byref(psid_owner), None, None, None,
+            ctypes.byref(psd)) != ERROR_SUCCESS:
+        return False
+    owner_len = advapi32.GetLengthSid(psid_owner)
+    owner_sid = ctypes.create_string_buffer(max(owner_len, 1))
+    ok = advapi32.CopySid(owner_len, owner_sid, psid_owner)
+    kernel32.LocalFree(wintypes.HANDLE(psd.value))
+    if not ok:
+        return False
+
+    # SYSTEM = S-1-5-18
+    psys = wintypes.LPVOID()
+    if not advapi32.AllocateAndInitializeSid(
+            NT_AUTHORITY, 1, LOCAL_SYSTEM_RID, 0, 0, 0, 0, 0, 0, 0,
+            ctypes.byref(psys)):
+        return False
+
+    # a fresh DACL: owner full access, SYSTEM full access, nobody else
+    acl = ctypes.create_string_buffer(256)
+    ok = (advapi32.InitializeAcl(acl, 256, ACL_REVISION)
+          and advapi32.AddAccessAllowedAceEx(
+              acl, ACL_REVISION, 0, FILE_ALL_ACCESS, owner_sid)
+          and advapi32.AddAccessAllowedAceEx(
+              acl, ACL_REVISION, 0, FILE_ALL_ACCESS, psys))
+    if ok:
+        # PROTECTED: without it Windows composes our explicit ACE list with
+        # any inheritable ACEs from the profile directory, silently widening
+        # the file beyond owner+SYSTEM
+        ok = advapi32.SetNamedSecurityInfoW(
+            path, SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            None, None, acl, None,
+        ) == ERROR_SUCCESS
+    advapi32.FreeSid(psys)
+    return bool(ok)
+
+
+# --- cross-platform additions (POSIX twins live in posix_helpers) ------------
+def user_name() -> str:
+    """The login name (hashes into the sync rendezvous name)."""
+    return os.environ.get("USERNAME", "user")
+
+
+def socket_path(name: str) -> str:
+    """Windows named pipes need no filesystem path -- the bare name IS the
+    rendezvous (Qt maps it to ``\\\\.\\pipe\\<name>``)."""
+    return name
+
+
+def is_network_dir(path: str) -> bool:
+    """True for UNC paths (``\\\\server\\share``): the sync state must not
+    live on a network profile (no reliable byte-range locking, and the
+    secret would sit on a share)."""
+    return str(path).startswith("\\\\")

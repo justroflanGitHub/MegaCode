@@ -8,6 +8,7 @@ real process: ``Pty`` is replaced by a no-op fake, and output is fed directly.
 from __future__ import annotations
 
 import os
+import sys
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -15,7 +16,9 @@ from typing import List  # noqa: E402
 
 import pytest  # noqa: E402
 from PySide6.QtCore import QEvent, QPointF, Qt  # noqa: E402
-from PySide6.QtGui import QGuiApplication, QKeyEvent, QMouseEvent  # noqa: E402
+from PySide6.QtGui import (
+    QColor, QGuiApplication, QKeyEvent, QMouseEvent,  # noqa: E402
+)
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from megacode import terminal_widget as tw  # noqa: E402
@@ -24,7 +27,9 @@ from megacode import terminal_widget as tw  # noqa: E402
 class _FakePty:
     """A stand-in for ``Pty`` that never spawns a child."""
 
+    # ConPTY-era semantics (LNM on) keep the bare-LF expectations below
     alive = True  # flip to False to simulate the child exiting
+    LNM_WORKAROUND = True
 
     def __init__(self, *_a, **_k) -> None:
         pass
@@ -706,8 +711,9 @@ holding a selection drag anchors instead of clearing."""
 
 
 def test_right_click_mid_drag_stops_autoscroll(term, qapp):
-    """QuickEdit copy (right-click) mid-drag clears the selection; the drag
-state and auto-scroll timer must not outlive it."""
+    """Right-click mid-drag: on Windows QuickEdit copies + clears, so the
+drag state and auto-scroll timer must not outlive it. On Linux the right
+button is the menu's; the still-held LEFT drag legitimately continues."""
     for i in range(60):
         term._on_output(f"line{i:02d}\r\n")
 
@@ -721,15 +727,27 @@ state and auto-scroll timer must not outlive it."""
                                Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton))
     assert term._autoscroll_timer.isActive()
 
-    # right button while the left drag is live -> copy + clear
+    # right button while the left drag is live
     term.mousePressEvent(_mouse(
         QEvent.Type.MouseButtonPress, QPointF(100, 100),
         Qt.MouseButton.RightButton,
         Qt.MouseButton.LeftButton | Qt.MouseButton.RightButton,
     ))
-    assert not term._autoscroll_timer.isActive()
-    assert not term._sel_dragging
-    assert not term._sel_active
+    if sys.platform == "win32":
+        # QuickEdit copy cleared the selection outright
+        assert not term._autoscroll_timer.isActive()
+        assert not term._sel_dragging
+        assert not term._sel_active
+    else:
+        # the left button is still held: the drag (and its auto-scroll)
+        # keep running and must die with the LEFT release, not linger
+        assert term._autoscroll_timer.isActive()
+        assert term._sel_dragging
+        term.mouseReleaseEvent(_mouse(
+            QEvent.Type.MouseButtonRelease, QPointF(100, 150),
+            Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton))
+        assert not term._autoscroll_timer.isActive()
+        assert not term._sel_dragging
 
 
 def test_tracking_enabled_mid_drag_release_is_clean(term, qapp):
@@ -862,3 +880,375 @@ def test_resize_reflow_cycle_stays_clean(term):
         assert not [h for h in (id(ln) for ln in term._screen.history.top) if h in buf_ids]
         assert term._screen.cursor.y < term._screen.lines
         assert term._screen.cursor.x < term._screen.columns
+
+
+def test_lnm_engages_only_for_conpty_backend(qapp):
+    """The LNM workaround is a ConPTY-stream compensation, NOT terminal
+    semantics: with a backend that does not request it (the Unix PTY), a
+    bare LF keeps the column (xterm index), and pyte's default mode stays
+    untouched."""
+    class _UnixFakePty(_FakePty):
+        LNM_WORKAROUND = False
+
+    saved = tw.Pty
+    tw.Pty = _UnixFakePty  # type: ignore[assignment]
+    try:
+        w = tw.TerminalWidget("fake", font_size=10)
+    finally:
+        tw.Pty = saved  # type: ignore[assignment]
+    w._cell_w, w._cell_h = 10, 20
+    w.resize(80 * 10, 24 * 20)
+    w.show()
+    qapp.processEvents()
+
+    import pyte.modes
+    assert pyte.modes.LNM not in w._screen.mode  # no ConPTY quirk to fix
+    w._on_output("abc")
+    w._on_output("\n")
+    w._on_output("x")
+    with w._lock:
+        line1 = w._screen.buffer[1]
+        cells = [line1[c].data for c in range(5)]
+    assert cells[0] == " "   # xterm LF: NO carriage return
+    assert cells[3] == "x"   # the column survives the linefeed
+
+
+# --- right/middle mouse buttons + theme switch (Debian user report) ---------
+
+class _RecordingPty(_FakePty):
+    """A fake PTY that records what the widget writes to the child."""
+
+    def __init__(self, *_a, **_k) -> None:
+        self.writes: List[str] = []
+
+    def write(self, text: str) -> None:
+        self.writes.append(text)
+
+
+@pytest.fixture()
+def recterm(qapp):
+    """TerminalWidget with a recording fake PTY (mouse-event tests)."""
+    saved = tw.Pty
+    tw.Pty = _RecordingPty  # type: ignore[assignment]
+    try:
+        w = tw.TerminalWidget("fake", font_size=10)
+    finally:
+        tw.Pty = saved  # type: ignore[assignment]
+    w._cell_w, w._cell_h = 10, 20
+    w.resize(80 * 10, 24 * 20)
+    w.show()
+    qapp.processEvents()
+    return w
+
+
+def test_middle_click_pastes_the_platform_selection(recterm, monkeypatch):
+    """X11: the middle button pastes the PRIMARY selection; Windows keeps
+    the clipboard paste (the Debian report: both buttons felt dead)."""
+    from PySide6.QtTest import QTest
+
+    pasted = []
+    monkeypatch.setattr(
+        recterm, "paste", lambda primary=False: pasted.append(primary))
+    QTest.mouseClick(recterm, Qt.MouseButton.MiddleButton)
+    assert pasted == [sys.platform != "win32"]
+
+
+def test_right_click_is_quickedit_only_on_windows(recterm, monkeypatch):
+    """On Windows right-click is QuickEdit copy/paste; on Linux the button
+    belongs to the context menu (menu itself is covered below), so the
+    press must not paste."""
+    from PySide6.QtTest import QTest
+
+    pasted = []
+    monkeypatch.setattr(
+        recterm, "paste", lambda primary=False: pasted.append(primary))
+    QTest.mouseClick(recterm, Qt.MouseButton.RightButton)
+    if sys.platform == "win32":
+        assert pasted == [False]  # no selection -> QuickEdit pastes
+    else:
+        assert pasted == []       # the menu's job, not QuickEdit's
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only menu")
+def test_posix_context_menu_actions(recterm, monkeypatch):
+    """Right-click on Linux opens Copy/Paste/Clear -- exactly these three
+    (the Debian follow-up asked for "Paste selection" to go away: the middle
+    button already covers the PRIMARY paste)."""
+    from PySide6.QtCore import QPoint
+    from PySide6.QtGui import QContextMenuEvent
+
+    shown = {}
+
+    class _Action:
+        def __init__(self, label):
+            self.label = label
+            self.enabled = True
+
+        def setEnabled(self, value):
+            self.enabled = value
+
+    class _Menu:
+        def __init__(self, _parent=None):
+            self.actions = []
+
+        def addAction(self, label):
+            action = _Action(label)
+            self.actions.append(action)
+            return action
+
+        def exec(self, _pos):
+            shown["menu"] = [(a.label, a.enabled) for a in self.actions]
+            return None
+
+    monkeypatch.setattr(tw, "QMenu", _Menu)
+    event = QContextMenuEvent(
+        QContextMenuEvent.Reason.Mouse, QPoint(4, 4), QPoint(10, 10))
+    recterm.contextMenuEvent(event)
+
+    labels = dict(shown["menu"])
+    assert set(labels) == {"Copy", "Paste", "Clear selection"}
+    assert labels["Copy"] is False            # nothing selected yet
+    assert labels["Clear selection"] is False
+
+    # with a live selection both selection actions enable
+    recterm._sel_start, recterm._sel_end = (0, 0), (0, 3)
+    recterm._sel_active = True
+    recterm.contextMenuEvent(event)
+    labels = dict(shown["menu"])
+    assert labels["Copy"] is True
+    assert labels["Clear selection"] is True
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows QuickEdit path")
+def test_windows_context_menu_stays_swallowed(recterm, monkeypatch):
+    from PySide6.QtCore import QPoint
+    from PySide6.QtGui import QContextMenuEvent
+
+    def _fail(*_a, **_k):
+        raise AssertionError("no menu may appear on Windows")
+
+    monkeypatch.setattr(tw, "QMenu", _fail)
+    event = QContextMenuEvent(
+        QContextMenuEvent.Reason.Mouse, QPoint(4, 4), QPoint(10, 10))
+    recterm.contextMenuEvent(event)  # must simply accept
+
+
+def test_shift_bypasses_app_mouse_tracking(recterm):
+    """Shift+click inside a mouse-tracking TUI (claude, htop) must act
+    locally: selection works, nothing is forwarded -- the xterm rule."""
+    from PySide6.QtTest import QTest
+
+    recterm._update_priv_modes("\x1b[?1000h\x1b[?1006h")
+    assert recterm._mouse_on
+    QTest.mouseClick(
+        recterm, Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.ShiftModifier)
+    assert recterm._sel_active          # local selection started
+    assert recterm._pty.writes == []    # nothing forwarded to the app
+
+
+def test_selection_publishes_to_primary(recterm, monkeypatch):
+    """The highlighted text becomes the X11 PRIMARY selection live (drag,
+    autoscroll, release), so the middle button pastes exactly what the user
+    selected -- the Debian report had it paste stale foreign text. Without
+    a selection clipboard (Windows) the publish is a no-op."""
+    from PySide6.QtGui import QClipboard
+
+    for i in range(5):
+        recterm._on_output(f"line{i}\r\n")
+
+    published = []
+    supports = {"selection": True}
+
+    class _Clipboard_:
+        def supportsSelection(self):
+            return supports["selection"]
+
+        def setText(self, text, mode=None):
+            published.append((text, mode))
+
+        def text(self, mode=None):
+            return ""
+
+    class _GuiStub:
+        @staticmethod
+        def clipboard():
+            return _Clipboard_()
+
+    monkeypatch.setattr(tw, "QGuiApplication", _GuiStub)
+
+    def _mouse(kind, pos, button, buttons):
+        return QMouseEvent(kind, pos, QPointF(100, 100), button, buttons,
+                           Qt.KeyboardModifier.NoModifier)
+
+    supports["selection"] = False  # Windows-like: publishing must be a no-op
+    recterm.mousePressEvent(_mouse(
+        QEvent.Type.MouseButtonPress, QPointF(5, 5),
+        Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton))
+    recterm.mouseMoveEvent(_mouse(
+        QEvent.Type.MouseMove, QPointF(45, 45),
+        Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton))
+    recterm.mouseReleaseEvent(_mouse(
+        QEvent.Type.MouseButtonRelease, QPointF(45, 45),
+        Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton))
+    assert published == []
+
+    supports["selection"] = True     # X11: every selection change publishes
+    recterm.mousePressEvent(_mouse(
+        QEvent.Type.MouseButtonPress, QPointF(5, 5),
+        Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton))
+    recterm.mouseMoveEvent(_mouse(
+        QEvent.Type.MouseMove, QPointF(45, 45),
+        Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton))
+    recterm.mouseReleaseEvent(_mouse(
+        QEvent.Type.MouseButtonRelease, QPointF(45, 45),
+        Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton))
+
+    texts = [t for t, m in published if m == QClipboard.Mode.Selection]
+    assert texts, "the selection was never published to PRIMARY"
+    assert "line1" in texts[-1]      # rows 0..2, cols per the drag geometry
+
+
+@pytest.mark.parametrize("name", sorted(tw.themes.SCHEMES))
+def test_selection_paints_inverted_colors(term, qapp, name):
+    """Selection = classic fg/bg inversion of the selected cells (the old
+    translucent overlay made selected text unreadable in dark themes and
+    near-invisible in light ones -- Debian report 1.1/1.2). Pins three
+    things: the band color (theme fg), the run BOUNDARY (the very next
+    unselected cell keeps the plain bg -- a run-split regression inverts
+    the whole row), and the swapped glyph pen (the selected cell contains
+    pixels of the theme bg: without the pen swap the text vanishes into
+    the band, the exact reported symptom)."""
+    from megacode import themes
+
+    themes.set_active(name)
+    term.refresh_theme()
+    term._on_output("hello")
+    term._sel_active = True
+    term._sel_start = (0, 0)
+    term._sel_end = (0, 3)           # "hell" selected; "o" + cursor stay plain
+
+    img = term.grab().toImage()
+    fg_lum = QColor(themes.active()["term_fg"]).lightness()
+    bg_lum = QColor(themes.active()["term_bg"]).lightness()
+    # band: inside the selected cell, above the glyphs
+    assert abs(QColor(img.pixel(5, 1)).lightness() - fg_lum) <= 25, name
+    # boundary: col 4 is one past the selection and must stay plain
+    assert abs(QColor(img.pixel(45, 1)).lightness() - bg_lum) <= 25, name
+    # glyph pen: the selected cell holds pixels of the bg color (the 'h'
+    # stroke drawn with the swapped pen); antialiasing blends toward the
+    # band, so the extreme over the whole cell is the honest probe
+    lums = [QColor(img.pixel(x, y)).lightness()
+            for x in range(0, 10) for y in range(0, 20)]
+    if bg_lum < fg_lum:      # dark theme: light band, dark glyphs
+        assert min(lums) <= bg_lum + 25, (name, min(lums), bg_lum)
+    else:                    # light theme: dark band, light glyphs
+        assert max(lums) >= bg_lum - 25, (name, max(lums), bg_lum)
+
+
+def test_plain_click_never_clobbers_primary(recterm, monkeypatch):
+    """A zero-drag click is a focus action, not a selection: it must publish
+    nothing to X11 PRIMARY, steal nothing when another application owns it,
+    and release our OWN stale PRIMARY (the xterm invariant). A real
+    selection over blank cells (text resolves empty) and every selection
+    CLEAR must also disown -- otherwise the middle button keeps pasting
+    text that is no longer highlighted (review findings)."""
+    from PySide6.QtGui import QClipboard
+
+    recterm._on_output("hello\r\n")
+
+    published = []
+    owns = {"value": False}
+
+    class _Clipboard_:
+        def supportsSelection(self):
+            return True
+
+        def ownsSelection(self):
+            return owns["value"]
+
+        def setText(self, text, mode=None):
+            published.append((text, mode))
+            owns["value"] = bool(text)
+
+        def text(self, mode=None):
+            return ""
+
+    class _GuiStub:
+        @staticmethod
+        def clipboard():
+            return _Clipboard_()
+
+    monkeypatch.setattr(tw, "QGuiApplication", _GuiStub)
+
+    def _mouse(kind, pos, button, buttons):
+        return QMouseEvent(kind, pos, QPointF(100, 100), button, buttons,
+                           Qt.KeyboardModifier.NoModifier)
+
+    def _drag(a, b):
+        recterm.mousePressEvent(_mouse(
+            QEvent.Type.MouseButtonPress, a,
+            Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton))
+        recterm.mouseMoveEvent(_mouse(
+            QEvent.Type.MouseMove, b,
+            Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton))
+        recterm.mouseReleaseEvent(_mouse(
+            QEvent.Type.MouseButtonRelease, b,
+            Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton))
+
+    # 1) plain click on a glyph cell: another app owns PRIMARY -> hands off;
+    #    when WE own it, the click releases it (nothing highlighted anymore)
+    _drag(QPointF(5, 5), QPointF(5, 5))     # zero-drag == plain click
+    assert published == []
+    owns["value"] = True
+    _drag(QPointF(5, 5), QPointF(5, 5))
+    assert published == [("", QClipboard.Mode.Selection)]
+    published.clear()
+    owns["value"] = False
+
+    # 2) a real selection over BLANK rows: text resolves empty -> disown,
+    # so PRIMARY can never serve text that is not what is highlighted
+    owns["value"] = True
+    _drag(QPointF(5, 110), QPointF(5, 150))  # rows 5..7 are blank
+    assert published and published[-1] == ("", QClipboard.Mode.Selection)
+    assert all(t == "" for t, _m in published)
+
+    # 3) a real text selection publishes, clearing it disowns
+    owns["value"] = True
+    _drag(QPointF(5, 5), QPointF(25, 5))     # "hel" on row 0
+    assert published[-1] == ("hel", QClipboard.Mode.Selection)
+    recterm._clear_selection()
+    assert published[-1] == ("", QClipboard.Mode.Selection)
+
+
+def test_left_click_still_forwards_when_tracking(recterm):
+    from PySide6.QtTest import QTest
+
+    recterm._update_priv_modes("\x1b[?1000h\x1b[?1006h")
+    QTest.mouseClick(recterm, Qt.MouseButton.LeftButton)
+    assert not recterm._sel_active
+    assert recterm._pty.writes          # SGR mouse bytes went to the child
+
+
+def test_refresh_theme_recolors_the_pane(term):
+    """Theme switch repaints existing panes with the new palette."""
+    from megacode import themes
+
+    themes.set_active("paper-light")
+    term.refresh_theme()
+    light = themes.SCHEMES["paper-light"]
+    assert term._default_bg == QColor(light["term_bg"])
+    assert term._default_fg == QColor(light["term_fg"])
+
+    themes.set_active("claude-dark")
+    term.refresh_theme()
+    assert term._default_bg == QColor("#1e1e1e")
+    assert term._default_fg == QColor("#d4d4d4")
+
+
+def test_resolve_color_follows_active_scheme():
+    from megacode import themes
+
+    themes.set_active("marine-night")
+    expected = QColor(themes.SCHEMES["marine-night"]["term_colors"]["red"])
+    assert tw._resolve_color("red", QColor("#ffffff")) == expected

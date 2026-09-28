@@ -44,7 +44,7 @@ log = logging.getLogger("megacode")
 #: reach inside a QTextDocument -- app.py owns the widget chrome).
 _DOC_CSS = """
 pre { background-color: #0d0f14; color: #c9d1dc; }
-code { font-family: "Consolas", "Cascadia Mono", monospace; font-size: 12px; }
+code { font-family: "Consolas", "Cascadia Mono", "DejaVu Sans Mono", "Liberation Mono", monospace; font-size: 12px; }
 a { color: #d97757; }
 p, li { margin: 0; }
 """

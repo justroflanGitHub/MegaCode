@@ -10,16 +10,25 @@ inside this widget, so moving the widget moves the session.
 from __future__ import annotations
 
 import re
+import sys
 import threading
 from typing import List, Optional
 
 import pyte
 import pyte.modes
 from PySide6.QtCore import QPointF, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QGuiApplication, QPainter, QPalette
-from PySide6.QtWidgets import QWidget
+from PySide6.QtGui import (
+    QClipboard, QColor, QFont, QFontMetrics, QGuiApplication, QPainter,
+    QPalette,
+)
+from PySide6.QtWidgets import QMenu, QWidget
 
-from .conpty import Pty
+from . import themes
+
+if sys.platform == "win32":
+    from .conpty import Pty
+else:
+    from .unixpty import Pty
 
 # pyte misparses private/extended SGR sequences (e.g. Kitty's underline-style
 # "ESC[>4;2m") as plain SGR 4 (underline), so the whole frame ends up
@@ -55,31 +64,35 @@ _AUTOSCROLL_INTERVAL_MS = 50
 _AUTOSCROLL_MAX_LINES = 8
 
 # --- theme & palette --------------------------------------------------------
-_DEFAULT_FG = "#d4d4d4"
-_DEFAULT_BG = "#1e1e1e"
-_SELECTION = QColor(255, 255, 255, 40)
+# Цвета дефолтного fg/bg, 16 ANSI-цветов и заливки выделения приходят из
+# активной схемы (themes.py) и читаются на каждом paint'е — смена темы не
+# требует пересоздания панелей, только refresh_theme() + repaint.
 
 # pyte emits the 16 ANSI colours by name; everything 256/truecolour comes as a
 # 6-digit hex string. (pyte maps SGR 33 -> "brown".)
-_PALETTE = {
-    "black": "#0c0c0c", "red": "#c50f1f", "green": "#13a10e",
-    "brown": "#c19c00", "yellow": "#c19c00", "blue": "#0037da",
-    "magenta": "#881798", "cyan": "#3a96dd", "white": "#cccccc",
-    "brightblack": "#767676", "brightred": "#e74856", "brightgreen": "#16c60c",
-    "brightyellow": "#f9f1a5", "brightblue": "#3b78ff", "brightmagenta": "#b4009e",
-    "brightcyan": "#61d6d6", "brightwhite": "#f2f2f2",
-}
 _HEX_DIGITS = set("0123456789abcdef")
 
 
 def _resolve_color(spec: str, default: QColor) -> QColor:
     if not spec or spec == "default":
         return default
-    if spec in _PALETTE:
-        return QColor(_PALETTE[spec])
+    palette = themes.active()["term_colors"]
+    if spec in palette:
+        return QColor(palette[spec])
     if len(spec) == 6 and all(ch in _HEX_DIGITS for ch in spec):
         return QColor("#" + spec)
     return default
+
+
+def _forward_mouse(event) -> bool:
+    """Should this mouse event go to the TUI app instead of acting locally?
+
+    The app asked for mouse tracking (DECSET 1000-1003), but Shift held
+    down means the user wants the terminal's own behaviour -- the xterm
+    convention: Shift freezes tracking so selection/paste/menus always
+    stay reachable inside mouse-aware TUIs (claude, htop...).
+    """
+    return not (event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
 
 
 class _ConPtyScreen(pyte.HistoryScreen):
@@ -157,11 +170,14 @@ class TerminalWidget(QWidget):
         self.setAutoFillBackground(False)
 
         # Windows Terminal's default face is "Cascadia Mono"; use it (with
-        # fallbacks) so glyphs and metrics match what the user expects.
+        # fallbacks) so glyphs and metrics match what the user expects. The
+        # Linux fallbacks (DejaVu/Liberation/Noto mono) cover Cyrillic on
+        # Astra/Fly, where none of the Windows faces exist.
         self._font = QFont("Cascadia Mono", font_size)
         self._font.setFamilies(
             ["Cascadia Mono", "Cascadia Code", "Cascadia Mono NF", "Consolas",
-             "DejaVu Sans Mono", "Courier New"]
+             "DejaVu Sans Mono", "Liberation Mono", "Noto Sans Mono",
+             "Courier New"]
         )
         self._font.setStyleHint(QFont.StyleHint.Monospace)
         self._font.setFixedPitch(True)
@@ -183,15 +199,19 @@ class TerminalWidget(QWidget):
         # against nano 8.5: "\n<ESC>[2dline-0000\n<ESC>[3d..." with zero CRLFs).
         # pyte's VT-strict LF keeps the column, which shears every TUI frame;
         # LNM makes pyte's linefeed do index + carriage return, like WT.
-        self._screen.mode.add(pyte.modes.LNM)
+        # A Unix PTY needs the opposite: the line discipline already emits CRLF
+        # for cooked output and raw-mode TUIs expect xterm LF semantics, so
+        # the flag engages only for the ConPTY backend (Pty.LNM_WORKAROUND).
+        if Pty.LNM_WORKAROUND:
+            self._screen.mode.add(pyte.modes.LNM)
         self._stream = _ConPtyStream(self._screen)
         self._pty_buf = ""
 
         self._pty = Pty(command, self._cols, self._rows, cwd=cwd)
         self._pty.start(self._on_output)
 
-        self._default_fg = QColor(_DEFAULT_FG)
-        self._default_bg = QColor(_DEFAULT_BG)
+        self._default_fg = QColor(themes.active()["term_fg"])
+        self._default_bg = QColor(themes.active()["term_bg"])
         # text selection + copy/paste
         self._sel_active = False
         self._sel_start: Optional[tuple[int, int]] = None
@@ -329,29 +349,32 @@ class TerminalWidget(QWidget):
             cursor_in_view = self._scroll_offset == 0
 
         painter.setFont(self._font)
+        # viewport-row -> (first_col, last_col) of the selection, resolved
+        # once per paint: selected cells swap their resolved fg/bg (classic
+        # terminal inversion -- see _draw_run), so the highlight stays
+        # readable in every scheme.
+        sel = ({r: (c1, c2) for r, c1, c2 in self._selection_ranges()}
+               if self._sel_active and self._sel_start is not None
+               and self._sel_end is not None else {})
         for row, chars in enumerate(snapshot):
-            self._draw_row(painter, row, chars, columns)
+            self._draw_row(painter, row, chars, columns, sel.get(row))
 
         if (not cursor_hidden and not self._dead and cursor_in_view
                 and 0 <= cursor_y < len(snapshot) and 0 <= cursor_x < columns):
-            self._draw_cursor(painter, cursor_x, cursor_y, snapshot[cursor_y][cursor_x])
-
-        self._draw_selection(painter)
+            cs = sel.get(cursor_y)
+            cursor_selected = cs is not None and cs[0] <= cursor_x <= cs[1]
+            self._draw_cursor(painter, cursor_x, cursor_y,
+                              snapshot[cursor_y][cursor_x], cursor_selected)
 
         if self._dead:
             painter.fillRect(self.rect(), QColor(0, 0, 0, 170))
             painter.setPen(QColor("#cccccc"))
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "[ process exited ]")
 
-    def _draw_selection(self, painter: QPainter) -> None:
-        if not self._sel_active or self._sel_start is None or self._sel_end is None:
-            return
-        for r, c1, c2 in self._selection_ranges():
-            x = c1 * self._cell_w
-            y = r * self._cell_h
-            painter.fillRect(x, y, (c2 - c1 + 1) * self._cell_w, self._cell_h, _SELECTION)
-
-    def _draw_row(self, painter: QPainter, row: int, chars: list, columns: int) -> None:
+    def _draw_row(
+        self, painter: QPainter, row: int, chars: list, columns: int,
+        sel: Optional[tuple[int, int]] = None,
+    ) -> None:
         y = row * self._cell_h
         max_cols = min(columns, self._cols_for_width())
         if not chars:
@@ -362,27 +385,40 @@ class TerminalWidget(QWidget):
             ch = chars[col]
             fg_spec, bg_spec = ch.fg, ch.bg
             bold, underline, reverse = ch.bold, ch.underscore, ch.reverse
+            selected = sel is not None and sel[0] <= col <= sel[1]
             run_chars = []
             run_end = col
             while run_end < max_cols:
                 c = chars[run_end]
+                sel_here = sel is not None and sel[0] <= run_end <= sel[1]
                 if (c.fg != fg_spec or c.bg != bg_spec or bool(c.bold) != bool(bold)
-                        or bool(c.underscore) != bool(underline) or bool(c.reverse) != bool(reverse)):
+                        or bool(c.underscore) != bool(underline) or bool(c.reverse) != bool(reverse)
+                        or sel_here != selected):
                     break
                 run_chars.append(c.data)
                 run_end += 1
-            self._draw_run(painter, col, y, run_chars, fg_spec, bg_spec, bold, underline, reverse)
+            self._draw_run(painter, col, y, run_chars, fg_spec, bg_spec, bold,
+                           underline, reverse, selected)
             col = run_end if run_end > col else col + 1
 
     def _draw_run(
         self, painter: QPainter, col: int, y: int, run_chars: List[str],
         fg_spec: str, bg_spec: str, bold: bool, underline: bool, reverse: bool,
+        selected: bool = False,
     ) -> None:
         text = "".join(run_chars)
         x = col * self._cell_w
         fg = _resolve_color(fg_spec, self._default_fg)
         bg = _resolve_color(bg_spec, self._default_bg)
         if reverse:
+            fg, bg = bg, fg
+        if selected:
+            # Classic terminal selection: swap the resolved cell colors. The
+            # old translucent overlay composites with whatever is under it,
+            # so light-on-light (dark theme, yellowish overlay) or
+            # light-on-light (paper theme, near-invisible overlay) both end
+            # with unreadable selected text; inversion is readable in every
+            # scheme by construction (Debian report items 1.1/1.2).
             fg, bg = bg, fg
         if bg != self._default_bg:
             painter.fillRect(x, y, self._cell_w * len(run_chars), self._cell_h, bg)
@@ -398,10 +434,20 @@ class TerminalWidget(QWidget):
         painter.setPen(fg)
         painter.drawText(x, y + self._ascent, text)
 
-    def _draw_cursor(self, painter: QPainter, col: int, row: int, char) -> None:
+    def _draw_cursor(
+        self, painter: QPainter, col: int, row: int, char, selected: bool = False,
+    ) -> None:
         x = col * self._cell_w
         y = row * self._cell_h
         fg = _resolve_color(char.fg, self._default_fg)
+        bg = _resolve_color(char.bg, self._default_bg)
+        if char.reverse:
+            fg, bg = bg, fg
+        if selected:
+            # Inside the selection band the block cursor would fill with the
+            # cell's fg -- the exact band color -- and disappear. Swap, like
+            # the glyphs, so the block reads as the band's text color.
+            fg, bg = bg, fg
         painter.fillRect(x, y, self._cell_w, self._cell_h, fg)
 
     # --- input --------------------------------------------------------------
@@ -455,7 +501,7 @@ class TerminalWidget(QWidget):
         return (row, col)
 
     def mousePressEvent(self, event) -> None:  # noqa: N802 (Qt signature)
-        if self._mouse_on:
+        if self._mouse_on and _forward_mouse(event):
             if event.button() == Qt.MouseButton.LeftButton:
                 # A press while the app tracks the mouse can never be part of
                 # a selection drag; clear any state left over from one.
@@ -470,18 +516,23 @@ class TerminalWidget(QWidget):
             self._sel_dragging = True
             self.update()
         elif button == Qt.MouseButton.RightButton:
-            # Windows console "QuickEdit": right-click copies the selection if
-            # there is one, otherwise pastes.
-            if self.has_selection():
-                self._copy_text(self._selection_text())
-                self._clear_selection()
-            else:
-                self.paste()
+            # Windows console "QuickEdit": right-click copies the selection
+            # if there is one, otherwise pastes. On Linux the right button
+            # is the context menu's (see contextMenuEvent) -- a paste with
+            # an empty clipboard would read as "the button does nothing".
+            if sys.platform == "win32":
+                if self.has_selection():
+                    self._copy_text(self._selection_text())
+                    self._clear_selection()
+                else:
+                    self.paste()
         elif button == Qt.MouseButton.MiddleButton:
-            self.paste()
+            # X11 convention: the middle button pastes the PRIMARY
+            # selection (what's currently highlighted), not the clipboard
+            self.paste(primary=sys.platform != "win32")
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802 (Qt signature)
-        if self._mouse_on:
+        if self._mouse_on and _forward_mouse(event):
             if event.buttons() & Qt.MouseButton.LeftButton:
                 self._send_mouse(event, pressed=True)
             return
@@ -489,6 +540,7 @@ class TerminalWidget(QWidget):
             self._sel_end = self._cell_at(event.position())
             self._update_autoscroll(event.position())
             self.update()
+            self._publish_selection()
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802 (Qt signature)
         if event.button() == Qt.MouseButton.LeftButton:
@@ -499,15 +551,23 @@ class TerminalWidget(QWidget):
             # the button that started it.
             self._sel_dragging = False
             self._stop_autoscroll()
-        if self._mouse_on:
+        if self._mouse_on and _forward_mouse(event):
             if event.button() == Qt.MouseButton.LeftButton:
                 self._send_mouse(event, pressed=False)
             return
         if event.button() == Qt.MouseButton.LeftButton and self._sel_active:
             self._sel_end = self._cell_at(event.position())
             self.update()
-            # No copy-on-select: the user copies explicitly with right-click,
-            # like the classic cmd console.
+            # No copy-on-select into the CLIPBOARD: the user copies explicitly
+            # with right-click / Ctrl+C, like the classic cmd console. The X11
+            # PRIMARY is a different channel and IS published live -- that is
+            # what the middle button pastes (see _publish_selection). A click
+            # without a drag selects nothing: xterm disowns PRIMARY then, and
+            # so do we -- a focus click must not clobber it with one char.
+            if self.has_selection():
+                self._publish_selection()
+            else:
+                self._disown_selection()
 
     def hideEvent(self, event) -> None:  # noqa: N802 (Qt signature)
         # A tile can be hidden mid-drag (closed / swapped away); the implicit
@@ -517,11 +577,32 @@ class TerminalWidget(QWidget):
         super().hideEvent(event)
 
     def contextMenuEvent(self, event) -> None:  # noqa: N802 (Qt signature)
-        # Swallow the native menu: the right button drives QuickEdit copy/paste.
+        # Windows keeps the QuickEdit right button (copy/paste on press);
+        # while an app tracks the mouse the click belongs to it (Shift
+        # bypasses -- see _forward_mouse). Everywhere else the right button
+        # opens the terminal's own menu, as a Linux user expects.
+        if sys.platform == "win32" or (self._mouse_on and _forward_mouse(event)):
+            event.accept()
+            return
+        menu = QMenu(self)
+        has_sel = self.has_selection()
+        copy_action = menu.addAction("Copy")
+        copy_action.setEnabled(has_sel)
+        paste_action = menu.addAction("Paste")
+        clear_action = menu.addAction("Clear selection")
+        clear_action.setEnabled(has_sel)
+        chosen = menu.exec(event.globalPos())
+        if chosen is copy_action:
+            self._copy_text(self._selection_text())
+            self._clear_selection()
+        elif chosen is paste_action:
+            self.paste()
+        elif chosen is clear_action:
+            self._clear_selection()
         event.accept()
 
     def wheelEvent(self, event) -> None:  # noqa: N802 (Qt signature)
-        if self._mouse_on:
+        if self._mouse_on and _forward_mouse(event):
             # App is tracking the mouse: forward the wheel as SGR mouse events so
             # mouse-aware TUIs (less, pagers, claude's scrollback) scroll themselves.
             self._send_wheel(event)
@@ -596,6 +677,7 @@ class TerminalWidget(QWidget):
         # while the mouse itself no longer moves.
         self._sel_end = self._cell_at(self._autoscroll_pos)
         self.update()
+        self._publish_selection()
 
     def _stop_autoscroll(self) -> None:
         self._autoscroll_timer.stop()
@@ -746,6 +828,9 @@ class TerminalWidget(QWidget):
     def _clear_selection(self) -> None:
         self._sel_active = False
         self._sel_start = self._sel_end = None
+        # nothing is highlighted here any more, so PRIMARY must not keep
+        # serving this pane's old text as "the selection"
+        self._disown_selection()
         # Any path that drops the selection also ends a drag in progress
         # (e.g. right-click QuickEdit copy mid-drag): otherwise the release
         # handler would find _sel_active already False, skip its cleanup and
@@ -757,11 +842,52 @@ class TerminalWidget(QWidget):
     def _copy_text(self, text: str) -> None:
         QGuiApplication.clipboard().setText(text)
 
-    def paste(self) -> None:
+    def _publish_selection(self) -> None:
+        """Own the X11 PRIMARY selection with the highlighted text.
+
+        xterm semantics: what is selected IS the middle-button paste -- here
+        and in every other application. Without publishing, PRIMARY holds
+        whatever was last selected elsewhere, so the middle button pasted
+        foreign text ("что-то другое" from the Debian report). No-op on
+        platforms without a selection clipboard (Windows: the middle button
+        pastes the clipboard instead). A degenerate (zero-drag) or
+        blank-cell selection owns nothing -- publishing one stray character
+        on every focus click would clobber the user's real selection.
+        """
+        if not self.has_selection():
+            return
+        clipboard = QGuiApplication.clipboard()
+        if not clipboard.supportsSelection():
+            return
+        text = self._selection_text()
+        if text.strip():
+            clipboard.setText(text, mode=QClipboard.Mode.Selection)
+        else:
+            # a real (banded) selection over blank cells resolves to bare
+            # newline separators -- publishing those would serve garbage;
+            # disown instead, like a collapsed selection
+            self._disown_selection()
+
+    def _disown_selection(self) -> None:
+        """Release PRIMARY ownership -- but only if this widget holds it.
+
+        Clearing unconditionally would steal the selection from whatever
+        other application legitimately owns it; ``ownsSelection`` keeps the
+        disown honest (no-op on Windows: there is no selection clipboard).
+        """
+        clipboard = QGuiApplication.clipboard()
+        if clipboard.supportsSelection() and clipboard.ownsSelection():
+            clipboard.setText("", mode=QClipboard.Mode.Selection)
+
+    def paste(self, primary: bool = False) -> None:
+        """Paste into the pane: the clipboard, or -- ``primary=True`` -- the
+        X11 PRIMARY selection (the middle-button paste on Linux)."""
         if self._dead:
             return
         self._scroll_to_bottom()
-        text = QGuiApplication.clipboard().text()
+        mode = (QClipboard.Mode.Selection if primary
+                else QClipboard.Mode.Clipboard)
+        text = QGuiApplication.clipboard().text(mode=mode)
         if not text:
             return
         self._deliver_paste(text)
@@ -951,6 +1077,25 @@ class TerminalWidget(QWidget):
     # --- lifecycle ----------------------------------------------------------
     def is_dead(self) -> bool:
         return self._dead
+
+    def refresh_theme(self) -> None:
+        """Re-read the active scheme's terminal colors and repaint.
+
+        Called by the workspace after themes.set_active: the paint loop
+        resolves ANSI names through themes.active() anyway, but the cached
+        default fg/bg, the widget palette and the backing store need the
+        explicit nudge.
+        """
+        scheme = themes.active()
+        self._default_fg = QColor(scheme["term_fg"])
+        self._default_bg = QColor(scheme["term_bg"])
+        palette = self.palette()
+        palette.setColor(QPalette.ColorRole.Window, self._default_bg)
+        palette.setColor(QPalette.ColorRole.Base, self._default_bg)
+        palette.setColor(QPalette.ColorRole.Text, self._default_fg)
+        palette.setColor(QPalette.ColorRole.WindowText, self._default_fg)
+        self.setPalette(palette)
+        self.update()
 
     def tick(self) -> None:
         """Called on a timer to detect child exit and refresh the cursor."""

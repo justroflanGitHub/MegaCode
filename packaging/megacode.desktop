@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=MegaCode
+GenericName=Claude Code workspace
+Comment=Несколько сессий Claude Code в одном окне: плитки, синхронизация ввода, AI-чат
+Exec=@BINDIR@/megacode
+Icon=utilities-terminal
+Terminal=false
+Categories=Development;System;TerminalEmulator;
+StartupWMClass=MegaCode

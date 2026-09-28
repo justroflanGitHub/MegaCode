@@ -1,0 +1,15 @@
+# Точные версии для Astra Linux SE 1.7.6 (python3.7, glibc 2.28, x86_64).
+#
+#   Онлайн:      pip3 install --user -r requirements-astra.txt
+#   Air-gap:     см. README-ASTRA.md — каталог wheels/ + флаги
+#                --no-index --find-links
+#
+# PySide6-Essentials 6.5.3 — последний PySide6 с колёсами под Python 3.7
+# (тег cp37-abi3-manylinux_2_28 точно соответствует glibc 2.28 в Astra).
+# Только Essentials: Addons тянет ещё ~200 МБ колёс и системные библиотеки
+# (nss, alsa, pulse), которые на Astra-хосте могут отсутствовать.
+# pyte 0.8.2 скрывает себя от Python 3.7 (requires-python), поэтому 0.8.1.
+PySide6-Essentials==6.5.3
+shiboken6==6.5.3
+pyte==0.8.1
+wcwidth

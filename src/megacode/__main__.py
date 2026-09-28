@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from .app import run
+from .runtime_env import prepare as _prepare_env
+
+_prepare_env()  # QPA + fontconfig defaults must win over any Qt import
+
+from .app import run  # noqa: E402 (import order is the point here)
 
 if __name__ == "__main__":
     raise SystemExit(run())

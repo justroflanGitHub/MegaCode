@@ -32,9 +32,13 @@ SHAPES: dict[int, Tuple[int, int]] = {
 }
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class Rect:
-    """An integer pixel rectangle: top-left origin plus size."""
+    """An integer pixel rectangle: top-left origin plus size.
+
+    (No ``slots=True``: that dataclass keyword needs Python 3.10+, and the
+    Astra Linux target runs 3.7.)
+    """
 
     x: int
     y: int

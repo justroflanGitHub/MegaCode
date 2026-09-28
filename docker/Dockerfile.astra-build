@@ -1,0 +1,86 @@
+# Собирает автономный бандл MegaCode (onedir) + .deb-пакет для Astra Linux SE 1.7.6.
+#
+# База — debian:10 (glibc 2.28, python 3.7): та же системная эпоха, что и
+# Astra 1.7.x, поэтому бинарник переносится на Astra без изменений.
+# PyInstaller <= 5.13 — последняя линейка с поддержкой Python 3.7;
+# onedir (не onefile): onefile распаковывается в /tmp при каждом старте,
+# что падает на хостах с noexec /tmp и медленно на air-gap-машинах.
+#
+# .deb раскладывает бандл в /opt/MegaCode, ставит обёртку /usr/bin/megacode
+# и ярлык меню; Depends только libc6 (>= 2.28) — всё остальное ввендорено
+# ниже, поэтому установка работает на машине без интернета.
+#
+#   docker build -t megacode/astra-build -f docker/Dockerfile.astra-build .
+#   docker run --rm -v "<путь>/dist-linux:/out" megacode/astra-build
+#   -> /out/MegaCode/  (бандл каталогом) и /out/megacode_<версия>_amd64.deb
+FROM megacode/testbed-debian10
+
+# PyInstaller's Linux binary analysis shells out to objdump (binutils);
+# the base image purges apt lists, so update (archive retries -- the
+# buster mirror is intermittently refusing from this network) then install.
+RUN (apt-get update || (sleep 8 && apt-get update) || true) \
+    && apt-get install -y --no-install-recommends binutils \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python -m pip install --no-cache-dir "pyinstaller==5.13.2"
+
+WORKDIR /src
+COPY src ./src
+COPY run_megacode.py ./
+COPY pyproject.toml ./
+COPY packaging ./packaging
+
+RUN pyinstaller --noconfirm --clean --windowed --onedir \
+    --name MegaCode --paths src run_megacode.py \
+# --- vendor every non-glibc system library the bundle links against ----
+# PyInstaller bundles the wheel's own Qt libs, but NOT system ones
+# (libGL, libEGL, libgssapi_krb5, libxkbcommon, xcb-cursor...)
+# -- an air-gapped Astra host may have none of them installed. Copying
+# the resolved closure next to the executable works because PyInstaller
+# sets RUNPATH=$ORIGIN. Deliberately EXCLUDED:
+#   * glibc family -- the bundle must use the host's glibc (2.28 on Astra);
+#   * libfontconfig -- it is CONFIG-coupled to the host: 2.13 (the wheel's)
+#     unconditionally scans /usr/share/fontconfig/conf.avail and warns on
+#     elements newer hosts use (<reset-dirs/>), while the HOST's own
+#     fontconfig always matches the host's config files (Astra: 2.14).
+ && cd dist/MegaCode \
+ && find . -type f | while read f; do ldd "$f" 2>/dev/null; done \
+    | grep '=> /' | awk '{print $3}' | sort -u \
+    | grep -vE '/(ld-linux|libc\.so|libm\.so|libpthread|libdl|librt|libresolv|libnsl|libutil|libcrypt|libanl|libmvec|libfontconfig)' \
+    | while read lib; do cp -Ln "$lib" .; done \
+# the PySide6 manylinux wheel ships its own libfontconfig.so.1 (2.13) and
+# PyInstaller flattens it next to the executable -- drop it the same way:
+# the host fontconfig must win (see the comment above)
+ && rm -f libfontconfig.so.1 \
+ && echo 'vendored libs:' && ls *.so* | head -50
+
+# --- .deb -----------------------------------------------------------------
+# dpkg-deb lives in the base image (dpkg is essential). --root-owner-group
+# pins every file to root:root without fakeroot. The wrapper exports
+# PYTHONUTF8 (the bundle's stdio paths); the app itself writes only to
+# the user's XDG dirs, so /opt/MegaCode never needs to be user-writable.
+RUN VER=$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml | head -n1) \
+    && pkg=dist/pkg \
+    && mkdir -p "$pkg/DEBIAN" "$pkg/opt/MegaCode" "$pkg/usr/bin" \
+       "$pkg/usr/share/applications" \
+    && cp -a dist/MegaCode/. "$pkg/opt/MegaCode/" \
+    && printf '#!/bin/sh\n# MegaCode launcher: the self-contained bundle lives in /opt/MegaCode.\nexport PYTHONUTF8=1\nexec /opt/MegaCode/MegaCode "$@"\n' \
+       > "$pkg/usr/bin/megacode" \
+    && chmod 755 "$pkg/usr/bin/megacode" \
+    && sed 's|@BINDIR@|/usr/bin|' packaging/megacode.desktop \
+       > "$pkg/usr/share/applications/megacode.desktop" \
+    && printf 'Package: megacode\nVersion: %s\nSection: utils\nPriority: optional\nArchitecture: amd64\nDepends: libc6 (>= 2.28), libfontconfig1\nMaintainer: MegaCode <megacode@example.invalid>\nInstalled-Size: %d\nDescription: Multi-pane Claude Code workspace\n Launch and tile multiple Claude Code sessions in one window:\n embedded terminal panes, input mirroring, tag groups, AI chat.\n Self-contained PySide6 build -- installs offline; the only extra\n requirement is the host fontconfig, because font rendering must\n follow the font configuration of the host itself.\n' \
+       "$VER" "$(du -sk "$pkg/opt" | cut -f1)" > "$pkg/DEBIAN/control" \
+    && printf '#!/bin/sh\nset -e\n# tar/scp transports can drop the exec bit; dpkg preserves it, this is\n# belt-and-braces for hand-copied packages\nchmod 755 /opt/MegaCode/MegaCode 2>/dev/null || true\nif command -v update-desktop-database >/dev/null 2>&1; then\n  update-desktop-database -q /usr/share/applications || true\nfi\n' \
+       > "$pkg/DEBIAN/postinst" \
+    && printf '#!/bin/sh\nset -e\nif [ "$1" = remove ] && command -v update-desktop-database >/dev/null 2>&1; then\n  update-desktop-database -q /usr/share/applications || true\nfi\n' \
+       > "$pkg/DEBIAN/postrm" \
+    && chmod 755 "$pkg/DEBIAN/postinst" "$pkg/DEBIAN/postrm" \
+    && dpkg-deb --root-owner-group --build "$pkg" \
+       "dist/megacode_${VER}-1_amd64.deb" \
+    && echo 'deb contents:' && dpkg-deb -c "dist/megacode_${VER}-1_amd64.deb" | head -5
+
+CMD ["sh", "-c", "rm -rf /out/MegaCode && rm -f /out/*.deb \
+&& cp -r /src/dist/MegaCode /out/ \
+&& cp /src/dist/*.deb /out/ \
+&& echo 'bundle: /out/MegaCode' && ls -la /out/*.deb"]

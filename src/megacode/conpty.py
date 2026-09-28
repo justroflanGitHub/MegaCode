@@ -49,6 +49,11 @@ _SYNCHRONIZE = 0x00100000
 class Pty:
     """A child process attached to a Windows pseudo-console."""
 
+    #: ConPTY re-emits output with the console's cooked newline semantics
+    #: (bare LF already means CR+LF), so terminal_widget forces pyte's LNM.
+    #: The Unix twin (unixpty.Pty) sets this False.
+    LNM_WORKAROUND = True
+
     def __init__(
         self,
         command: str,

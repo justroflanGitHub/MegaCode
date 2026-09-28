@@ -1,10 +1,23 @@
 [project]
 name = "megacode"
 version = "0.1.0"
-description = "Launch and tile multiple Claude Code instances in Windows Terminal."
+description = "Launch and tile multiple Claude Code sessions — embedded panes on Windows and Linux (Astra), or tiled external terminal windows."
 readme = "README.md"
-requires-python = ">=3.11"
-dependencies = ["PySide6>=6.6"]
+# 3.7 floor = Astra Linux SE 1.7.6's system python3 (Debian-10 base); the
+# source stays 3.7-clean so one tree serves both targets.
+requires-python = ">=3.7"
+dependencies = [
+    "PySide6>=6.6; sys_platform == 'win32'",
+    # 6.5.3 = the last PySide6 with cp37 wheels (cp37-abi3-manylinux_2_28,
+    # exactly Astra 1.7.6's glibc); Essentials alone — the app needs only
+    # QtCore/Gui/Widgets/Network, and Addons drags nss/alsa/pulse deps in
+    "PySide6-Essentials>=6.5.3; sys_platform == 'linux'",
+    # pyte 0.8.2's requires-python hides it from 3.7; 0.8.1 is the pin for
+    # the Astra build
+    "pyte>=0.8.2; python_version >= '3.8'",
+    "pyte==0.8.1; python_version < '3.8'",
+    "pywinpty>=2.0; sys_platform == 'win32'",
+]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

@@ -15,7 +15,7 @@ import tempfile
 import traceback
 from typing import Optional
 
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QSettings, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QKeySequence, QPainter, QPalette, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -34,225 +34,27 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from . import plat_helpers
 from . import shells
-from . import terminal as separate_terminal
+from . import sync_security
+from . import themes
 from .layouts import SUPPORTED, compute_layout
-from .tags import TAG_COLORS
+from .sync_bus import SyncBus
 from .workspace import WorkspaceView
+
+if sys.platform == "win32":
+    from . import terminal as separate_terminal
+
+    _SEPARATE_AVAILABLE = True
+else:
+    from . import terminal_posix as separate_terminal
+
+    _SEPARATE_AVAILABLE = separate_terminal.available()
 
 log = logging.getLogger("megacode")
 
-# --- palette ----------------------------------------------------------------
-BG = "#0e1014"
-CARD = "#161a21"
-BORDER = "#232830"
-BORDER_HI = "#3a4150"
-ACCENT = "#d97757"
-ACCENT_HI = "#e08866"
-TEXT = "#e6e6e6"
-MUTED = "#8a93a3"
-CELL = "#3a3f4b"
-
-# Tag-chip QSS, one rule per color class, generated from the same palette
-# tags.py hashes tag names into -- chips, menu icons and QSS can never
-# disagree about a tag's color. (Inserted into QSS below; its braces are
-# literal content, not f-string placeholders.)
-_tag_chip_qss = "".join(
-    f'QLabel#tileTag[tagClass="{i}"] '
-    f'{{ background: {bg}; border: 1px solid {bd}; }}\n'
-    for i, (bg, bd) in enumerate(TAG_COLORS)
-)
-
-QSS = f"""
-QWidget#root, QWidget#workspace {{ background: {BG}; }}
-QLabel {{ color: {TEXT}; }}
-QLabel#title {{ font-size: 22px; font-weight: 600; }}
-QLabel#subtitle {{ color: {MUTED}; font-size: 12px; }}
-QLabel#section {{ color: {MUTED}; font-size: 11px; }}
-QLabel#status {{ color: {MUTED}; font-size: 11px; }}
-
-QLineEdit {{
-    background: {CARD}; border: 1px solid {BORDER}; border-radius: 8px;
-    padding: 8px 10px; color: {TEXT};
-}}
-QLineEdit:focus {{ border: 1px solid {BORDER_HI}; }}
-QSpinBox {{
-    background: {CARD}; border: 1px solid {BORDER}; border-radius: 8px;
-    padding: 5px 6px; color: {TEXT};
-}}
-QSpinBox:focus {{ border: 1px solid {BORDER_HI}; }}
-
-QPushButton#count {{
-    background: {CARD}; border: 1px solid {BORDER}; border-radius: 12px;
-    padding: 16px; color: {TEXT}; font-size: 18px; font-weight: 600;
-}}
-QPushButton#count:hover {{ border: 1px solid {BORDER_HI}; background: #1b2029; }}
-QPushButton#count:checked {{
-    background: #3a2a22; border: 1px solid {ACCENT}; color: #f3e3dc;
-}}
-QPushButton#secondary, QPushButton#toolbarBtn {{
-    background: {CARD}; border: 1px solid {BORDER}; border-radius: 8px;
-    padding: 8px 14px; color: {TEXT};
-}}
-QPushButton#secondary:hover, QPushButton#toolbarBtn:hover {{ border: 1px solid {BORDER_HI}; }}
-QComboBox {{
-    background: {CARD}; border: 1px solid {BORDER}; border-radius: 8px;
-    padding: 6px 10px; color: {TEXT};
-}}
-QComboBox:hover {{ border: 1px solid {BORDER_HI}; }}
-QComboBox::drop-down {{ border: none; width: 22px; }}
-QComboBox QAbstractItemView {{
-    background: {CARD}; border: 1px solid {BORDER}; color: {TEXT};
-    selection-background-color: #2a2f3a; outline: 0;
-}}
-QToolButton#toolbarBtn {{
-    background: {CARD}; border: 1px solid {BORDER}; border-radius: 8px;
-    padding: 6px 12px; color: {TEXT};
-}}
-QToolButton#toolbarBtn:hover {{ border: 1px solid {BORDER_HI}; }}
-QToolButton#toolbarBtn:disabled {{ color: {MUTED}; border: 1px solid {BORDER}; }}
-/* the sync-input toggle reads as "armed" while mirroring is live */
-QToolButton#toolbarBtn:checked {{
-    background: #3a2a22; border: 1px solid {ACCENT}; color: #f3e3dc;
-}}
-/* the run-pasted button lights up while some pane holds pasted input */
-QToolButton#toolbarBtn[armed="true"] {{
-    border: 1px solid {ACCENT}; color: {ACCENT_HI};
-}}
-QToolButton#toolbarBtn::menu-button {{ border: none; width: 16px; }}
-QPushButton#launch {{
-    background: {ACCENT}; border: none; border-radius: 10px;
-    padding: 14px; color: #1a120e; font-size: 14px; font-weight: 700;
-}}
-QPushButton#launch:hover {{ background: {ACCENT_HI}; }}
-QPushButton#launch:disabled {{ background: #3a3a3a; color: #777777; }}
-
-/* workspace */
-QFrame#toolbar {{ background: {CARD}; border: 1px solid {BORDER}; border-radius: 10px; }}
-QLabel#toolbarTitle {{ color: {TEXT}; font-size: 13px; font-weight: 600; }}
-/* the broadcast bar's command box: slimmer than the launcher fields so it
-   matches the toolbar buttons' height, darker to read as an input */
-QLineEdit#broadcastInput {{
-    background: {BG}; border: 1px solid {BORDER}; border-radius: 8px;
-    padding: 5px 10px; color: {TEXT};
-}}
-QLineEdit#broadcastInput:focus {{ border: 1px solid {ACCENT}; }}
-QFrame#tile {{ background: #1e1e1e; border: 1px solid #2a2a2a; border-radius: 6px; }}
-QFrame#tile[drop="true"] {{ border: 2px solid {ACCENT}; }}
-QFrame#tileHeader {{ background: #252526; border-top-left-radius: 6px; border-top-right-radius: 6px; }}
-QLabel#tileGrip {{ color: #6a6a6a; font-size: 14px; }}
-QLabel#tileTitle {{ color: #cccccc; font-size: 12px; }}
-QPushButton#tileClose {{
-    background: transparent; border: none; color: #9a9a9a; font-size: 16px; padding: 0 6px;
-}}
-QPushButton#tileClose:hover {{ color: #e74856; }}
-/* sync-group tag chips (see tags.py / workspace.py) */
-QWidget#tileChips {{ background: transparent; }}
-QLabel#tileTag {{ border-radius: 7px; font-size: 10px; padding: 0 6px; color: {TEXT}; }}
-{_tag_chip_qss}
-/* sync-domain tint: WHERE a keystroke will go while sync is armed. On the
-   header, not the tile frame -- that channel belongs to drop="true". */
-QFrame#tileHeader[sync="peer"] {{ background: #2e2118; }}
-QFrame#tileHeader[sync="source"] {{ background: #33241a; }}
-QFrame#tileHeader[sync="source"] QLabel#tileTitle {{ color: {ACCENT_HI}; }}
-/* pane resizing: the gaps between tiles are draggable splitter handles */
-QSplitter::handle {{ background: transparent; border-radius: 3px; }}
-QSplitter::handle:hover, QSplitter::handle:pressed {{ background: {BORDER_HI}; }}
-
-/* AI chat tiles (web-chatbot look; see chat_widget.py) */
-QWidget#chatRoot {{
-    background: #12151a;
-    border-bottom-left-radius: 6px; border-bottom-right-radius: 6px;
-}}
-QScrollArea#chatScroll {{ background: transparent; border: none; }}
-QWidget#chatMessages {{ background: transparent; }}
-QLabel#chatErrorBubble {{
-    background: #2e1c1e; border: 1px solid #5a2f34; border-radius: 12px;
-    border-bottom-left-radius: 4px; padding: 8px 12px;
-    color: #f0989e; font-size: 12px;
-}}
-QTextBrowser#chatUserBubble {{
-    background: #3a2a22; border: 1px solid #613d2f; border-radius: 12px;
-    border-bottom-right-radius: 4px; padding: 8px 12px;
-    color: #f3e3dc; font-size: 13px;
-    selection-background-color: #2a2f3a;
-}}
-QTextBrowser#chatAssistantBubble {{
-    background: #1b2027; border: 1px solid #262c36; border-radius: 12px;
-    border-bottom-left-radius: 4px; padding: 8px 12px;
-    color: {TEXT}; font-size: 13px;
-    selection-background-color: #2a2f3a;
-}}
-QLabel#chatThinking {{
-    background: transparent; color: {MUTED}; font-size: 12px;
-    font-style: italic;
-}}
-QToolButton#chatCopyBtn {{
-    background: {CARD}; border: 1px solid {BORDER}; border-radius: 6px;
-    color: {MUTED}; font-size: 11px; padding: 2px 8px;
-}}
-QToolButton#chatCopyBtn:hover {{
-    color: {TEXT}; border: 1px solid {BORDER_HI}; background: #1b2029;
-}}
-QLabel#chatEmptyGlyph {{ color: {ACCENT}; font-size: 26px; }}
-QLabel#chatEmptyTitle {{ color: {TEXT}; font-size: 15px; font-weight: 600; }}
-QLabel#chatEmptyHint {{ color: {MUTED}; font-size: 12px; }}
-QToolButton#chatJumpBtn {{
-    background: {CARD}; border: 1px solid {BORDER_HI}; border-radius: 13px;
-    color: {TEXT}; font-size: 11px; padding: 4px 12px;
-}}
-QToolButton#chatJumpBtn:hover {{
-    border: 1px solid {ACCENT}; color: {ACCENT_HI}; background: #1b2029;
-}}
-QFrame#chatInputBar {{ background: #12151a; border-top: 1px solid #1c212a; }}
-QFrame#chatModelBar {{ background: #12151a; border-top: 1px solid #1c212a; }}
-QComboBox#chatModelCombo, QComboBox#chatEffortCombo {{
-    background: {CARD}; border: 1px solid {BORDER}; border-radius: 6px;
-    padding: 2px 8px; color: {TEXT}; font-size: 11px;
-}}
-QComboBox#chatModelCombo:hover, QComboBox#chatEffortCombo:hover {{
-    border: 1px solid {BORDER_HI};
-}}
-QComboBox#chatModelCombo::drop-down, QComboBox#chatEffortCombo::drop-down {{
-    border: none; width: 16px;
-}}
-QPlainTextEdit#chatInput {{
-    background: {CARD}; border: 1px solid {BORDER}; border-radius: 12px;
-    padding: 8px 12px; color: {TEXT}; font-size: 13px;
-    selection-background-color: #2a2f3a;
-}}
-QPlainTextEdit#chatInput:focus {{ border: 1px solid {BORDER_HI}; }}
-QToolButton#chatSendBtn {{
-    background: {ACCENT}; border: none; border-radius: 16px;
-    color: #1a120e; font-size: 15px; font-weight: 700;
-    min-width: 32px; max-width: 32px; min-height: 32px; max-height: 32px;
-}}
-QToolButton#chatSendBtn:hover {{ background: {ACCENT_HI}; }}
-QToolButton#chatSendBtn:pressed {{ background: #c4684a; }}
-QToolButton#chatSendBtn:disabled {{ background: #3a3a3a; color: #777777; border: none; }}
-QToolButton#chatSendBtn[streaming="true"] {{
-    background: {CARD}; border: 1px solid {BORDER_HI}; color: {TEXT};
-}}
-QToolButton#chatSendBtn[streaming="true"]:hover {{
-    border: 1px solid {ACCENT}; color: {ACCENT_HI}; background: #1b2029;
-}}
-QScrollArea#chatScroll QScrollBar:vertical,
-QPlainTextEdit#chatInput QScrollBar:vertical {{
-    background: transparent; width: 8px; margin: 2px;
-}}
-QScrollArea#chatScroll QScrollBar::handle:vertical,
-QPlainTextEdit#chatInput QScrollBar::handle:vertical {{
-    background: {BORDER}; border-radius: 3px; min-height: 24px;
-}}
-QScrollArea#chatScroll QScrollBar::handle:vertical:hover {{ background: {BORDER_HI}; }}
-QScrollArea#chatScroll QScrollBar::handle:vertical:pressed {{ background: {ACCENT}; }}
-QScrollArea#chatScroll QScrollBar::add-line:vertical,
-QScrollArea#chatScroll QScrollBar::sub-line:vertical,
-QPlainTextEdit#chatInput QScrollBar::add-line:vertical,
-QPlainTextEdit#chatInput QScrollBar::sub-line:vertical {{ height: 0; }}
-QScrollArea#chatScroll QScrollBar::add-page:vertical,
-QScrollArea#chatScroll QScrollBar::sub-page:vertical {{ background: transparent; }}
-"""
+# Палитра и весь QSS приложения теперь живут в themes.py (смена тем из
+# тулбара рабочего пространства); «claude-dark» повторяет прежние константы.
 
 
 class LayoutPreview(QWidget):
@@ -277,7 +79,7 @@ class LayoutPreview(QWidget):
         rect = self.rect().adjusted(inset, inset, -inset, -inset)
         area = Rect(rect.x(), rect.y(), rect.width(), rect.height())
         for cell in compute_layout(self._n, area, gap=10):
-            painter.setBrush(QColor(CELL))
+            painter.setBrush(QColor(themes.active()["cell"]))
             painter.drawRoundedRect(cell.x, cell.y, cell.w, cell.h, 8, 8)
 
 
@@ -370,14 +172,17 @@ class LauncherPage(QWidget):
         line.addWidget(self._run_combo, 1)
         col.addLayout(line)
         self._custom_edit = QLineEdit()
-        self._custom_edit.setPlaceholderText("command, e.g. pwsh -NoLogo")
+        self._custom_edit.setPlaceholderText(
+            "command, e.g. pwsh -NoLogo" if sys.platform == "win32"
+            else "command, e.g. htop")
         self._custom_edit.setVisible(False)
         col.addWidget(self._custom_edit)
         row.addLayout(col, 1)
-        # default to Command Prompt (set after _custom_edit exists, so the
-        # change handler doesn't run against a half-built widget)
+        # default to the platform's plain shell (set after _custom_edit
+        # exists, so the change handler doesn't run against a half-built
+        # widget)
         for i in range(self._run_combo.count()):
-            if self._run_combo.itemData(i) == "cmd":
+            if self._run_combo.itemData(i) == shells.DEFAULT_KIND:
                 self._run_combo.setCurrentIndex(i)
                 break
         return row
@@ -413,6 +218,9 @@ class LauncherPage(QWidget):
 
     def _secondary_button(self) -> QWidget:
         btn = QPushButton("Open as separate windows", objectName="secondary")
+        # the legacy mode needs a spawnable external terminal; hide it when
+        # the platform has none (Linux without xterm -- see terminal_posix)
+        btn.setVisible(_SEPARATE_AVAILABLE)
         btn.clicked.connect(self._emit_separate)
         return btn
 
@@ -509,11 +317,49 @@ class MainWindow(QMainWindow):
 
         self._workspace = WorkspaceView()
         self._workspace.all_closed.connect(self._on_all_closed)
+        self._workspace.linkedInfoChanged.connect(self._on_linked_info)
+        self._workspace.linkPrefRequested.connect(self._on_link_pref)
+        self._workspace.themeChanged.connect(self.apply_theme)
         self._stack.addWidget(self._workspace)  # index 1
 
-        self.setStyleSheet(QSS)
+        # Cross-window linking: one bus per process, owned here and injected
+        # into the workspace. MainWindow is the ONLY place the persistent
+        # preference gates the auto-start -- the toolbar chip must always be
+        # able to re-link for the session, so SyncBus itself does not check
+        # the settings file.
+        self._bus = SyncBus(sync_security.state_dir())
+        prefs = sync_security.settings_load(sync_security.state_dir())
+        self._workspace.set_link_pref(bool(prefs.get("link_windows")))
+        if self._bus_may_start(prefs):
+            self._workspace.set_link(self._bus)
+
+        self.setStyleSheet(themes.build_qss(themes.active()))
         QShortcut(QKeySequence("F11"), self, activated=self._toggle_fullscreen)
         self._enter_launcher()
+
+    # --- color scheme ----------------------------------------------------
+    def apply_theme(self, name: str) -> None:
+        """Switch the whole window to another scheme and persist the choice.
+
+        The startup theme is applied before MainWindow exists (run() calls
+        themes.set_active with the stored name), so this only serves the
+        toolbar menu's live switches.
+        """
+        themes.set_active(name)
+        settings = QSettings()
+        settings.setValue("theme", name)
+        scheme = themes.active()
+        self.setStyleSheet(themes.build_qss(scheme))
+        app = QApplication.instance()
+        if app is not None:
+            # the QPalette roles matter for the few unstyled surfaces
+            # (e.g. tooltips and menus around the QSS-painted chrome)
+            palette = app.palette()
+            palette.setColor(QPalette.ColorRole.Window, QColor(scheme["bg"]))
+            palette.setColor(
+                QPalette.ColorRole.WindowText, QColor(scheme["text"]))
+            app.setPalette(palette)
+        self._workspace.apply_theme()
 
     def _toggle_fullscreen(self) -> None:
         if self.isFullScreen():
@@ -589,8 +435,44 @@ class MainWindow(QMainWindow):
         self._enter_launcher()
         self._launcher.set_status("All terminals closed.")
 
+    # --- cross-window linking --------------------------------------------------
+    def _bus_may_start(self, prefs: dict) -> bool:
+        """Auto-start gates, in order. Hard gates (env / elevation / state
+        dir) live in SyncBus.start(); this is only the persisted preference
+        and the elevation notice -- both user-facing launch decisions."""
+        import os as _os
+        if _os.environ.get("MEGACODE_NO_LINK"):
+            return False
+        if prefs.get("link_windows") is False:
+            return False
+        if plat_helpers.is_process_elevated() and not prefs.get(
+                "link_windows_forced"):
+            self._launcher.set_status("Window linking off (elevated).")
+            return False
+        return True
+
+    def _on_link_pref(self, on: bool) -> None:
+        """Persist the 'Link windows' preference and apply it now."""
+        directory = sync_security.state_dir()
+        prefs = sync_security.settings_load(directory)
+        prefs["link_windows"] = bool(on)
+        try:
+            sync_security.settings_save(directory, prefs)
+        except OSError:
+            log.exception("could not persist link settings")
+        if on:
+            self._workspace.set_link(self._bus)  # idempotent connect+start
+        else:
+            self._bus.stop()
+
+    def _on_linked_info(self, n: int) -> None:
+        self.setWindowTitle("MegaCode" if n < 2 else f"MegaCode — linked: {n} windows")
+
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt signature)
+        # order matters: the workspace's cleanup publishes the empty digest
+        # while the link is still alive, THEN the bus says its goodbyes
         self._workspace.cleanup()
+        self._bus.stop(reason="shutdown")
         super().closeEvent(event)
 
 
@@ -599,10 +481,24 @@ def _setup_logging() -> None:
     root.setLevel(logging.INFO)
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
     try:
-        log_path = os.path.join(tempfile.gettempdir(), "megacode.log")
+        if sys.platform == "win32":
+            log_dir = tempfile.gettempdir()
+        else:
+            # NOT /tmp: it is world-readable, and the log carries window titles
+            log_dir = os.path.join(
+                os.environ.get("XDG_CACHE_HOME",
+                               os.path.join(os.path.expanduser("~"), ".cache")),
+                "megacode")
+            os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "megacode.log")
         fh = logging.FileHandler(log_path, encoding="utf-8")
         fh.setFormatter(fmt)
         root.addHandler(fh)
+        if sys.platform != "win32":
+            try:
+                os.chmod(log_path, 0o600)
+            except OSError:
+                pass
     except Exception:  # noqa: BLE001
         pass
     if sys.stderr:
@@ -612,6 +508,11 @@ def _setup_logging() -> None:
 
 
 def _excepthook(exc_type, exc_value, tb) -> None:
+    if issubclass(exc_type, KeyboardInterrupt):
+        # ^C while a Qt slot runs: the SIGINT handler owns shutdown now.
+        # A modal "error" box here was why the app refused to die on ^C.
+        logging.getLogger("megacode").warning("KeyboardInterrupt in a slot")
+        return
     logging.getLogger("megacode").critical(
         "Uncaught exception", exc_info=(exc_type, exc_value, tb)
     )
@@ -620,16 +521,58 @@ def _excepthook(exc_type, exc_value, tb) -> None:
         QMessageBox.critical(None, "MegaCode - error", text)
 
 
+def _install_quit_signals(app: QApplication) -> None:
+    """Make ^C (and SIGTERM) shut the app down instead of dying inside it.
+
+    Without a handler, Ctrl+C raises KeyboardInterrupt in whatever Qt slot
+    happens to run next (timers tick constantly); PySide6 logs it via
+    sys.excepthook and the event loop just continues -- the process becomes
+    unkillable from the terminal it was started in. First signal quits
+    gracefully (closeEvent still kills the PTY children); a second one
+    exits hard, the way a user pressed ^C twice expects.
+    """
+    import signal
+
+    state = {"requested": False}
+
+    def _handler(_signum, _frame) -> None:
+        if state["requested"]:
+            os._exit(130)
+        state["requested"] = True
+        # from the handler it is unsafe to touch Qt directly; a queued
+        # 0-timeout shot lands in the running event loop instead
+        QTimer.singleShot(0, app.quit)
+
+    handled = [signal.SIGINT]
+    if sys.platform != "win32":
+        handled.append(signal.SIGTERM)  # `timeout`, systemd, kill default
+    for sig in handled:
+        try:
+            signal.signal(sig, _handler)
+        except (ValueError, OSError):
+            pass  # not the main thread / unsupported on this platform
+
+
+def _load_theme_setting() -> str:
+    """The persisted scheme name, or the default for a first run."""
+    stored = QSettings().value("theme", "", type=str)
+    return stored if stored in themes.SCHEMES else themes.DEFAULT_SCHEME
+
+
 def run() -> int:
     _setup_logging()
     sys.excepthook = _excepthook
 
     app = QApplication(sys.argv)
     app.setApplicationName("MegaCode")
+    app.setOrganizationName("MegaCode")
     app.setApplicationDisplayName("MegaCode")
+    _install_quit_signals(app)
+    themes.set_active(_load_theme_setting())
     palette = app.palette()
-    palette.setColor(QPalette.ColorRole.Window, QColor(BG))
-    palette.setColor(QPalette.ColorRole.WindowText, QColor(TEXT))
+    palette.setColor(QPalette.ColorRole.Window, QColor(themes.active()["bg"]))
+    palette.setColor(
+        QPalette.ColorRole.WindowText, QColor(themes.active()["text"]))
     app.setPalette(palette)
 
     window = MainWindow()

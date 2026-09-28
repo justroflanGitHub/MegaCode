@@ -12,7 +12,7 @@ env/
 # PyInstaller build artifacts
 build/
 dist/
-*.spec.bak
+*.spec
 
 # Editors / OS
 .idea/
@@ -25,3 +25,6 @@ Thumbs.db
 
 # Generated dev artifacts
 docs/terminal_preview.png
+
+# Linux bundle build output (docker/Dockerfile.astra-build)
+dist-linux/

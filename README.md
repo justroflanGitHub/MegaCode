@@ -3,15 +3,25 @@
 Launch several **Claude Code** sessions at once and manage them in a single
 window — tiled, and **drag-to-swap**.
 
+Runs on **Windows 10/11** and, from this port, natively on **Astra Linux SE
+1.7.6** (Debian-10 base, system python3 3.7) — see **README-ASTRA.md** for
+the Astra install (including air-gapped). One source tree serves both:
+the PTY backend (`conpty.py` / `unixpty.py`), the process/security helpers
+(`win32_helpers.py` / `posix_helpers.py` via the `plat_helpers.py` facade)
+and the external-terminal mode (`terminal.py` / `terminal_posix.py`) are
+selected by `sys.platform`.
+
 Two launch modes:
 
 - **Workspace (default)** — one MegaCode window hosting a grid of *embedded*
   terminals. Minimize/restore them all at once, and drag any terminal's header
   onto another to swap their positions. The running sessions survive the swap.
-- **Separate windows** — the original mode: opens N Windows Terminal windows and
-  tiles them across the monitor (handy if you'd rather use real WT windows).
+- **Separate windows** — the original mode: opens N Windows Terminal windows
+  and tiles them across the monitor (on Linux: xterm with geometry-at-spawn,
+  or qterminal/konsole tiled via wmctrl — see README-ASTRA.md).
 
-Each terminal can run **Claude Code**, **PowerShell**, **Command Prompt**, or a
+Each terminal can run **Claude Code**, a shell (**PowerShell** /
+**Command Prompt** on Windows, **Bash** on Linux), or a
 **custom command** — pick it at launch, and mix types later with the Add
 button's dropdown. The Add menu also offers an **AI Chat** tile: a dark
 web-chatbot-style panel (bubbles, streaming markdown, Enter to send) backed by
@@ -32,15 +42,23 @@ Pick **2, 3, 4 or 6** instances; the grid shape is:
 
 ## Requirements (runtime)
 
-- **Windows 10/11** (uses ConPTY, the Win32 API and Windows Terminal)
+- **Windows 10/11** (uses ConPTY, the Win32 API and Windows Terminal), or
+  **Astra Linux SE 1.7.6** / a Debian-10-era Linux with python3 >= 3.7
 - **Claude Code** (`claude`) on your `PATH`
-- **Windows Terminal** (`wt.exe`) — only needed for the *separate windows* mode
+- **Windows Terminal** (`wt.exe`) — only needed for the *separate windows*
+  mode on Windows (on Linux that mode wants `xterm`)
 
 ## Run from source
 
 ```bash
 .venv/Scripts/python.exe -m pip install -r requirements-dev.txt
 .venv/Scripts/python.exe -m megacode          # dev: PYTHONPATH=src python -m megacode
+```
+
+On Linux/Astra from a checkout:
+
+```bash
+./megacode.sh          # or: PYTHONPATH=src python3 -m megacode
 ```
 
 ## Build the standalone .exe
@@ -125,6 +143,27 @@ Each embedded terminal behaves like the classic Windows console:
   `@echo off` keeps working. Tags travel with the pane across drag-swaps
   and disappear when it closes; **↵ Run pasted** deliberately ignores
   groups (your hands placed those commands pane by pane).
+- **Linked windows (separate MegaCode instances)** — launch several MegaCode
+  windows (separate processes, not tiles in one window) and they link
+  automatically over a local named pipe, same Windows user and session. A
+  **⛓ N windows** chip appears in the toolbar once a partner is found, and
+  everything above grows to span every linked window: tag groups become
+  cross-window (a `fe` pane here and a `fe` pane there are one group),
+  **⇉ Sync input** reaches same-group panes in the other windows (their
+  headers pulse cool-blue as keys arrive — the warm source/peer tint stays
+  meaningful per window), and a scoped `@fe git pull` also runs in that
+  tag's panes in the linked windows (an unscoped run stays in this window).
+  The sync toggle itself is one shared state: turning it on in one window
+  turns it on everywhere, with a "set in W2" flash saying where it came
+  from. Uncheck the ⛓ chip to isolate a window for the session (one click
+  links it back); the Add-menu **Link windows** item is the persistent
+  preference across restarts. Privacy: the pipe is per-user and
+  challenge–response authenticated with a per-user secret, and only tag
+  names, pane counts and the mirrored keystrokes themselves ever leave the
+  process — no titles, commands, paths or terminal output. Linking is
+  disabled for elevated processes and over network-profile home folders,
+  caps at 16 windows, and a crashed or closed window is dropped from the
+  group automatically (the survivor re-elects a hub within a moment).
 
 ## AI Chat tiles
 
@@ -158,6 +197,10 @@ src/megacode/
   chat_widget.py      # the AI Chat tile: bubbles, markdown, streaming UI
   workspace.py        # resizable/draggable grid of terminal/chat tiles, in one window
   tags.py             # pure tag grammar + palette for the tag sync groups
+  sync_protocol.py    # wire grammar for linked windows (pure framing + validation)
+  sync_security.py    # per-user link state: secret rotation, settings, atomic writes
+  sync_bus.py         # the cross-window link: QLockFile-elected hub + pipe clients
+  remote_registry.py  # what the other linked windows look like (tags/panes/names)
   terminal.py         # separate-windows mode (wt.exe launch + Win32 tiling)
   app.py              # launcher <-> workspace UI
 ```
@@ -173,5 +216,10 @@ src/megacode/
 ```
 
 The pytest suite runs headless (it sets `QT_QPA_PLATFORM=offscreen`) and covers
-the layout math plus the terminal widget's scrollback viewport, selection
-resolution, mouse encoding and resize-history behaviour.
+the layout math, the terminal widget's scrollback viewport, selection
+resolution, mouse encoding and resize-history behaviour, the tag-group
+grammar and scoped runs, and the cross-window link — including full
+two-workspace/two-bus integration tests on a real named pipe inside one
+process (input relay, sync replication, scoped runs, the kill switch and
+the hostile-endpoint cases: forged handshakes, flooders, squatters, epoch
+races, hub death and re-election).

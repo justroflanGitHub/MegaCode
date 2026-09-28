@@ -18,12 +18,13 @@ import json
 import logging
 import os
 import re
+import sys
 import warnings
 from typing import List, Optional
 
-from PySide6.QtCore import QObject, QProcess, Signal
+from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, Signal
 
-from . import shells
+from . import childenv, shells
 
 log = logging.getLogger("megacode")
 
@@ -120,6 +121,18 @@ class ClaudeChatBackend(QObject):
             return False
         proc = QProcess(self)
         proc.setWorkingDirectory(self._cwd)
+        if sys.platform != "win32":
+            # same leak as the PTY: claude's child binaries (ripgrep, shells
+            # it spawns) must not resolve libstdc++ from the frozen bundle
+            # (see childenv); QProcess defaults to the parent environment
+            qenv = QProcessEnvironment.systemEnvironment()
+            cleaned = childenv.drop_bundle_entries(
+                qenv.value("LD_LIBRARY_PATH"))
+            if cleaned is None:
+                qenv.remove("LD_LIBRARY_PATH")
+            else:
+                qenv.insert("LD_LIBRARY_PATH", cleaned)
+            proc.setProcessEnvironment(qenv)
         proc.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
         self._buffer = b""
         self._stderr_tail = ""
